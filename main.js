@@ -262,8 +262,8 @@ const crawler = new PlaywrightCrawler({
   },
 
   browserPoolOptions: { useFingerprints: true },
-  maxRequestRetries: 2,
-  requestHandlerTimeoutSecs: 180,
+  maxRequestRetries: 1,
+  requestHandlerTimeoutSecs: 300,
   navigationTimeoutSecs: 60,
 
   async requestHandler({ page, request }) {
