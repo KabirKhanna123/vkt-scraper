@@ -107,7 +107,6 @@ const manualEventId = input.eventId || null;
 
 let events;
 if (manualEventId) {
-  // For manual runs, fetch the real event data from Supabase so we have name/venue/date/stubhub_url
   const { data } = await supabase.from('events').select('id,name,date,venue,platform,is_major,stubhub_url').eq('id', manualEventId).limit(1);
   events = data && data.length > 0
     ? data
@@ -153,16 +152,14 @@ const crawler = new PlaywrightCrawler({
     const originalName = event.name || 'Event ' + eventId;
 
     console.log(`\nScraping: ${originalName} (${eventId})`);
-    console.log(`  URL: ${request.url}`);
 
-    // Check if redirected to wrong page
     const title = await page.title();
     console.log(`  Title: ${title.slice(0, 100)}`);
 
     if (/Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(title)) {
-      console.log(`  Wrong page, retrying with short URL...`);
       const shortUrl = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
       if (request.url !== shortUrl) {
+        console.log('  Wrong page, retrying with short URL...');
         await page.goto(shortUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
         await page.waitForTimeout(3000);
         const newTitle = await page.title();
@@ -183,18 +180,53 @@ const crawler = new PlaywrightCrawler({
       } catch(_) {}
     }
 
-    // Wait for ticket prices to render
-    console.log('  Waiting for prices to render...');
+    // Wait for prices to appear
+    console.log('  Waiting for prices...');
     try {
       await page.waitForFunction(() => {
         const text = document.body?.innerText || '';
         return /\$\s*\d+/.test(text) && /listings?/i.test(text);
       }, { timeout: 20000 });
-      console.log('  Prices detected.');
     } catch(_) {
-      console.log('  Price wait timed out, extracting anyway...');
       await page.waitForTimeout(5000);
     }
+
+    // Scroll through the listings container to force virtual rows to render
+    console.log('  Scrolling listings to load more prices...');
+    await page.evaluate(async () => {
+      // Find the scrollable listings container
+      const selectors = [
+        '#listings-container',
+        '[data-testid="listings-container"]',
+        '[data-testid="ExpandableScrollContainer"]',
+        '[id*="listing"]',
+        '[class*="listing-container"]',
+        '[class*="ListingContainer"]'
+      ];
+
+      let container = null;
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && el.scrollHeight > el.clientHeight) {
+          container = el;
+          break;
+        }
+      }
+
+      const scrollTarget = container || document.documentElement;
+
+      // Scroll down in steps to trigger virtual row rendering
+      for (let i = 0; i < 8; i++) {
+        scrollTarget.scrollTop += 600;
+        await new Promise(r => setTimeout(r, 600));
+      }
+
+      // Scroll back to top to capture floor price
+      scrollTarget.scrollTop = 0;
+      await new Promise(r => setTimeout(r, 500));
+    });
+
+    await page.waitForTimeout(1000);
 
     const html = await page.content();
     const canonicalUrl = extractCanonicalUrl(html, eventId);
@@ -225,28 +257,30 @@ const crawler = new PlaywrightCrawler({
 
       const bodyText = document.body?.innerText || '';
 
+      // Listing count
       const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
         .map(m => parseInt(m[1].replace(/,/g, ''), 10))
         .filter(v => Number.isFinite(v) && v > 0);
       const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
 
-      const prices = [];
+      // Collect all prices from visible text
+      const priceSet = new Set();
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       let node;
       while ((node = walker.nextNode())) {
         try {
           if (!node.parentElement) continue;
-          if (node.parentElement.closest('script,style,noscript,svg')) continue;
+          if (node.parentElement.closest('script,style,noscript,svg,header,footer,nav')) continue;
           const style = window.getComputedStyle(node.parentElement);
           if (style.display === 'none' || style.visibility === 'hidden') continue;
           for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
             const value = parseFloat(match[1].replace(/,/g, ''));
-            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.push(value);
+            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) priceSet.add(value);
           }
         } catch(_) { continue; }
       }
-      prices.sort((a, b) => a - b);
 
+      const prices = [...priceSet].sort((a, b) => a - b);
       return { name, date, venue, totalListings, prices };
     }, { minPrice: MIN_PRICE, maxPrice: MAX_PRICE });
 
@@ -256,16 +290,13 @@ const crawler = new PlaywrightCrawler({
     const date = normalizeDateString(data.date) || event.date || null;
     const { totalListings, prices } = data;
 
-    console.log(`  Listings found: ${totalListings}, Prices found: ${prices.length}`);
+    console.log(`  Listings: ${totalListings}, Prices found: ${prices.length}`);
 
     const summary = summarizePrices(prices);
-    if (!summary.floor) {
-      console.log(`  No pricing for ${name}`);
-      return;
-    }
+    if (!summary.floor) { console.log(`  No pricing for ${name}`); return; }
 
     console.log(`  ${name} | ${date} | ${venue}`);
-    console.log(`  ${totalListings} listings, floor $${summary.floor}, atp $${summary.avg}`);
+    console.log(`  ${totalListings} listings, floor $${summary.floor}, atp $${summary.avg}, ceiling $${summary.ceiling}`);
 
     await postSnapshot({
       eventId, eventName: name, eventDate: date, venue, platform: 'StubHub',
