@@ -100,6 +100,49 @@ async function postSnapshot(payload) {
   } catch(e) { console.error('Snapshot error:', e.message); return false; }
 }
 
+// Extract all prices from page including by intercepting network data
+async function extractAllPrices(page, minPrice, maxPrice) {
+  return await page.evaluate(({ minPrice, maxPrice }) => {
+    const prices = new Set();
+
+    // 1. Try Next.js / React hydration data which contains all listing prices
+    const scripts = Array.from(document.querySelectorAll('script'));
+    for (const script of scripts) {
+      const text = script.textContent || '';
+      // Look for price arrays in embedded JSON
+      const priceMatches = text.matchAll(/"price"\s*:\s*([\d.]+)/g);
+      for (const m of priceMatches) {
+        const v = parseFloat(m[1]);
+        if (Number.isFinite(v) && v >= minPrice && v <= maxPrice) prices.add(v);
+      }
+      // Also look for currentPrice, listPrice patterns
+      const currentPriceMatches = text.matchAll(/"(?:currentPrice|listPrice|sellingPrice|amount)"\s*:\s*([\d.]+)/g);
+      for (const m of currentPriceMatches) {
+        const v = parseFloat(m[1]);
+        if (Number.isFinite(v) && v >= minPrice && v <= maxPrice) prices.add(v);
+      }
+    }
+
+    // 2. Walk all visible text nodes for $ prices
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      try {
+        if (!node.parentElement) continue;
+        if (node.parentElement.closest('script,style,noscript,svg,header,footer,nav')) continue;
+        const style = window.getComputedStyle(node.parentElement);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+          const value = parseFloat(match[1].replace(/,/g, ''));
+          if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.add(value);
+        }
+      } catch(_) { continue; }
+    }
+
+    return [...prices].sort((a, b) => a - b);
+  }, { minPrice, maxPrice });
+}
+
 await Actor.init();
 
 const input = await Actor.getInput() || {};
@@ -180,60 +223,38 @@ const crawler = new PlaywrightCrawler({
       } catch(_) {}
     }
 
-    // Wait for prices to appear
-    console.log('  Waiting for prices...');
+    // Wait for listings
+    console.log('  Waiting for listings...');
     try {
-      await page.waitForFunction(() => {
-        const text = document.body?.innerText || '';
-        return /\$\s*\d+/.test(text) && /listings?/i.test(text);
-      }, { timeout: 20000 });
+      await page.waitForFunction(() => /\$\s*\d+/.test(document.body?.innerText || '') && /listings?/i.test(document.body?.innerText || ''), { timeout: 20000 });
     } catch(_) {
       await page.waitForTimeout(5000);
     }
 
-    // Scroll through the listings container to force virtual rows to render
-    console.log('  Scrolling listings to load more prices...');
-    await page.evaluate(async () => {
-      // Find the scrollable listings container
-      const selectors = [
-        '#listings-container',
-        '[data-testid="listings-container"]',
-        '[data-testid="ExpandableScrollContainer"]',
-        '[id*="listing"]',
-        '[class*="listing-container"]',
-        '[class*="ListingContainer"]'
-      ];
+    // Use Playwright mouse wheel to scroll the listings panel
+    console.log('  Scrolling with mouse wheel...');
+    try {
+      // Click in the middle of the listings area to focus it
+      await page.mouse.click(640, 500);
+      await page.waitForTimeout(500);
 
-      let container = null;
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el && el.scrollHeight > el.clientHeight) {
-          container = el;
-          break;
-        }
+      // Scroll down 10 times using mouse wheel
+      for (let i = 0; i < 10; i++) {
+        await page.mouse.wheel(0, 800);
+        await page.waitForTimeout(500);
       }
-
-      const scrollTarget = container || document.documentElement;
-
-      // Scroll down in steps to trigger virtual row rendering
-      for (let i = 0; i < 8; i++) {
-        scrollTarget.scrollTop += 600;
-        await new Promise(r => setTimeout(r, 600));
-      }
-
-      // Scroll back to top to capture floor price
-      scrollTarget.scrollTop = 0;
-      await new Promise(r => setTimeout(r, 500));
-    });
+    } catch(e) {
+      console.log('  Mouse scroll failed:', e.message);
+    }
 
     await page.waitForTimeout(1000);
 
     const html = await page.content();
     const canonicalUrl = extractCanonicalUrl(html, eventId);
 
-    const data = await page.evaluate(({ minPrice, maxPrice }) => {
+    // Extract metadata
+    const meta = await page.evaluate(() => {
       let name = null, date = null, venue = null;
-
       const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
       for (const script of scripts) {
         try {
@@ -256,39 +277,22 @@ const crawler = new PlaywrightCrawler({
       }
 
       const bodyText = document.body?.innerText || '';
-
-      // Listing count
       const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
         .map(m => parseInt(m[1].replace(/,/g, ''), 10))
         .filter(v => Number.isFinite(v) && v > 0);
       const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
 
-      // Collect all prices from visible text
-      const priceSet = new Set();
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-      let node;
-      while ((node = walker.nextNode())) {
-        try {
-          if (!node.parentElement) continue;
-          if (node.parentElement.closest('script,style,noscript,svg,header,footer,nav')) continue;
-          const style = window.getComputedStyle(node.parentElement);
-          if (style.display === 'none' || style.visibility === 'hidden') continue;
-          for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-            const value = parseFloat(match[1].replace(/,/g, ''));
-            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) priceSet.add(value);
-          }
-        } catch(_) { continue; }
-      }
+      return { name, date, venue, totalListings };
+    });
 
-      const prices = [...priceSet].sort((a, b) => a - b);
-      return { name, date, venue, totalListings, prices };
-    }, { minPrice: MIN_PRICE, maxPrice: MAX_PRICE });
+    // Extract prices using enhanced method including script data
+    const prices = await extractAllPrices(page, MIN_PRICE, MAX_PRICE);
 
-    let name = data.name || originalName;
+    let name = meta.name || originalName;
     if (name && name.toLowerCase().includes('tickets')) name = originalName;
-    const venue = data.venue || event.venue || null;
-    const date = normalizeDateString(data.date) || event.date || null;
-    const { totalListings, prices } = data;
+    const venue = meta.venue || event.venue || null;
+    const date = normalizeDateString(meta.date) || event.date || null;
+    const { totalListings } = meta;
 
     console.log(`  Listings: ${totalListings}, Prices found: ${prices.length}`);
 
