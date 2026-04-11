@@ -112,37 +112,27 @@ async function postSnapshot(payload) {
 }
 
 async function dismissModals(page) {
-  // Close any modal overlays
   await page.evaluate(() => {
-    // Remove modal-root overlays
     const modal = document.querySelector('#modal-root');
     if (modal) modal.innerHTML = '';
-    // Remove any fixed overlays
-    document.querySelectorAll('[class*="overlay"], [class*="modal"], [class*="Modal"]').forEach(el => {
+    document.querySelectorAll('[class*="overlay"], [class*="modal"]').forEach(el => {
       const style = window.getComputedStyle(el);
-      if (style.position === 'fixed' || style.position === 'absolute') el.remove();
+      if (style.position === 'fixed') el.remove();
     });
   });
-
-  // Also try clicking close buttons
-  for (const sel of [
-    'button:has-text("Accept")', 'button:has-text("Continue")',
-    'button:has-text("Close")', 'button[aria-label="Close"]',
-    'button:has-text("Got it")', 'button:has-text("OK")'
-  ]) {
+  for (const sel of ['button:has-text("Accept")', 'button:has-text("Continue")', 'button:has-text("Close")', 'button[aria-label="Close"]', 'button:has-text("Got it")']) {
     try {
       const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 400 })) {
-        await el.click({ timeout: 700 });
-        await page.waitForTimeout(300);
-      }
+      if (await el.isVisible({ timeout: 300 })) { await el.click({ timeout: 500 }); await page.waitForTimeout(200); }
     } catch(_) {}
   }
 }
 
-async function extractVisiblePrices(page) {
+async function extractPricesFromPage(page) {
   return await page.evaluate(({ minPrice, maxPrice }) => {
     const prices = new Set();
+
+    // Walk visible text nodes for $ prices
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let node;
     while ((node = walker.nextNode())) {
@@ -171,17 +161,23 @@ async function getListingCount(page) {
   });
 }
 
-// Click a category button using JS dispatchEvent to bypass overlays
-async function jsClick(page, index) {
-  return await page.evaluate((idx) => {
-    const buttons = Array.from(document.querySelectorAll('button'))
-      .filter(b => /^Category\s+\d/i.test((b.innerText || '').trim()));
-    if (buttons[idx]) {
-      buttons[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-      return true;
-    }
-    return false;
-  }, index);
+// Inject fetch interceptor into page and capture the next ticketClasses URL
+async function interceptNextCategoryUrl(page) {
+  await page.evaluate(() => {
+    window.__capturedCategoryUrl = null;
+    window.__origFetch = window.__origFetch || window.fetch;
+    window.fetch = function(...args) {
+      const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+      if (url.includes('ticketClasses=') && url.includes('event') && !url.includes('google') && !url.includes('doubleclick')) {
+        window.__capturedCategoryUrl = url.startsWith('http') ? url : 'https://www.stubhub.com' + url;
+      }
+      return window.__origFetch.apply(this, args);
+    };
+  });
+}
+
+async function getCapturedUrl(page) {
+  return await page.evaluate(() => window.__capturedCategoryUrl);
 }
 
 await Actor.init();
@@ -226,7 +222,7 @@ const crawler = new PlaywrightCrawler({
 
   browserPoolOptions: { useFingerprints: true },
   maxRequestRetries: 2,
-  requestHandlerTimeoutSecs: 120,
+  requestHandlerTimeoutSecs: 180,
   navigationTimeoutSecs: 45,
 
   async requestHandler({ page, request }) {
@@ -253,10 +249,9 @@ const crawler = new PlaywrightCrawler({
       } else { return; }
     }
 
-    // Dismiss modals
     await dismissModals(page);
 
-    // Wait for page
+    // Wait for page to load
     console.log('  Waiting for page...');
     try {
       await page.waitForFunction(() => {
@@ -266,10 +261,7 @@ const crawler = new PlaywrightCrawler({
     } catch(_) { await page.waitForTimeout(5000); }
 
     await page.waitForTimeout(1500);
-
-    // Dismiss modals again after page settles
     await dismissModals(page);
-    await page.waitForTimeout(500);
 
     const html = await page.content();
     const canonicalUrl = extractCanonicalUrl(html, eventId);
@@ -306,55 +298,88 @@ const crawler = new PlaywrightCrawler({
     const date = normalizeDateString(meta.date) || event.date || null;
     const totalListings = await getListingCount(page);
 
-    // Get category buttons info
+    // Get category buttons with floor prices from aria-label
     const categoryButtons = await page.evaluate(() => {
       return Array.from(document.querySelectorAll('button'))
         .filter(b => /^Category\s+\d/i.test((b.innerText || '').trim()))
-        .map((b, i) => ({
-          label: (b.innerText || '').trim().split('\n')[0].trim(),
-          // Extract floor price from aria-label: "Select Category 1 - $2,372"
-          floor: (() => {
-            const aria = b.getAttribute('aria-label') || '';
-            const m = aria.match(/\$\s*([\d,]+)/);
-            return m ? parseFloat(m[1].replace(/,/g, '')) : null;
-          })(),
-          index: i
-        }));
+        .map((b, i) => {
+          const aria = b.getAttribute('aria-label') || '';
+          const priceMatch = aria.match(/\$\s*([\d,]+)/);
+          return {
+            label: (b.innerText || '').trim().split('\n')[0].trim(),
+            floor: priceMatch ? parseFloat(priceMatch[1].replace(/,/g, '')) : null,
+            index: i
+          };
+        });
     });
 
     console.log(`  ${categoryButtons.length} categories, ${totalListings} listings`);
 
     const categoryData = [];
+    const baseUrl = request.url.split('?')[0];
 
     if (categoryButtons.length > 0) {
       for (const cat of categoryButtons) {
         try {
-          // Use JS click to bypass modal overlay
-          const clicked = await jsClick(page, cat.index);
-          if (!clicked) { console.log(`  ${cat.label}: button not found`); continue; }
+          // Reset the interceptor
+          await interceptNextCategoryUrl(page);
 
-          console.log(`  Clicked ${cat.label} (JS)`);
-          await page.waitForTimeout(3000);
+          // JS click to trigger the fetch
+          await page.evaluate((idx) => {
+            const buttons = Array.from(document.querySelectorAll('button'))
+              .filter(b => /^Category\s+\d/i.test((b.innerText || '').trim()));
+            if (buttons[idx]) {
+              buttons[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
+          }, cat.index);
 
-          const catPrices = await extractVisiblePrices(page);
-          const catListings = await getListingCount(page);
-          const summary = summarizePrices(catPrices);
+          // Wait for fetch to fire
+          await page.waitForTimeout(2000);
 
-          // Use aria-label floor as the definitive floor if extraction misses it
-          const floor = summary.floor || cat.floor;
-          console.log(`  ${cat.label}: ${catListings} listings, floor $${floor}, atp $${summary.avg}, ceiling $${summary.ceiling} (${catPrices.length} prices)`);
-          categoryData.push({ label: cat.label, listings: catListings, floor, avg: summary.avg, ceiling: summary.ceiling });
+          // Get the captured URL
+          let categoryUrl = await getCapturedUrl(page);
 
-          // Deselect
-          await jsClick(page, cat.index);
-          await page.waitForTimeout(1000);
+          if (categoryUrl) {
+            console.log(`  ${cat.label}: navigating to filtered URL`);
+
+            // Navigate to the filtered category page
+            await page.goto(categoryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.waitForTimeout(2000);
+
+            // Extract prices from this filtered view
+            const catPrices = await extractPricesFromPage(page);
+            const catListings = await getListingCount(page);
+            const summary = summarizePrices(catPrices);
+
+            console.log(`  ${cat.label}: ${catListings} listings, floor $${summary.floor || cat.floor}, atp $${summary.avg}, ceiling $${summary.ceiling} (${catPrices.length} prices)`);
+            categoryData.push({
+              label: cat.label,
+              listings: catListings,
+              floor: summary.floor || cat.floor,
+              avg: summary.avg,
+              ceiling: summary.ceiling
+            });
+
+            // Navigate back to base event page
+            await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.waitForTimeout(2000);
+            await dismissModals(page);
+
+          } else {
+            // Fallback: use aria-label floor only
+            console.log(`  ${cat.label}: no URL captured, using floor from aria-label`);
+            if (cat.floor) categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
+          }
 
         } catch(e) {
-          console.log(`  ${cat.label} error: ${e.message}`);
-          // Still save the floor from aria-label
-          if (cat.floor) {
-            categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
-          }
+          console.log(`  ${cat.label} error: ${e.message.slice(0, 80)}`);
+          if (cat.floor) categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
+          // Try to navigate back
+          try {
+            await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.waitForTimeout(2000);
+            await dismissModals(page);
+          } catch(_) {}
         }
       }
     }
@@ -371,7 +396,7 @@ const crawler = new PlaywrightCrawler({
         ceiling: ceilings.length ? Math.max(...ceilings) : null,
       };
     } else {
-      const prices = await extractVisiblePrices(page);
+      const prices = await extractPricesFromPage(page);
       eventSummary = summarizePrices(prices);
     }
 
