@@ -107,7 +107,11 @@ const manualEventId = input.eventId || null;
 
 let events;
 if (manualEventId) {
-  events = [{ id: manualEventId, name: 'Manual', date: null, venue: null, platform: 'StubHub', is_major: false, stubhub_url: null }];
+  // For manual runs, fetch the real event data from Supabase so we have name/venue/date/stubhub_url
+  const { data } = await supabase.from('events').select('id,name,date,venue,platform,is_major,stubhub_url').eq('id', manualEventId).limit(1);
+  events = data && data.length > 0
+    ? data
+    : [{ id: manualEventId, name: 'Manual', date: null, venue: null, platform: 'StubHub', is_major: false, stubhub_url: null }];
 } else {
   events = await getEvents();
 }
@@ -140,8 +144,8 @@ const crawler = new PlaywrightCrawler({
 
   browserPoolOptions: { useFingerprints: true },
   maxRequestRetries: 2,
-  requestHandlerTimeoutSecs: 60,
-  navigationTimeoutSecs: 30,
+  requestHandlerTimeoutSecs: 120,
+  navigationTimeoutSecs: 45,
 
   async requestHandler({ page, request }) {
     const { event } = request.userData;
@@ -149,14 +153,17 @@ const crawler = new PlaywrightCrawler({
     const originalName = event.name || 'Event ' + eventId;
 
     console.log(`\nScraping: ${originalName} (${eventId})`);
+    console.log(`  URL: ${request.url}`);
 
+    // Check if redirected to wrong page
     const title = await page.title();
+    console.log(`  Title: ${title.slice(0, 100)}`);
+
     if (/Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(title)) {
-      console.log(`  Wrong page: ${title.slice(0, 80)}`);
+      console.log(`  Wrong page, retrying with short URL...`);
       const shortUrl = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
       if (request.url !== shortUrl) {
-        console.log('  Retrying with short URL...');
-        await page.goto(shortUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto(shortUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
         await page.waitForTimeout(3000);
         const newTitle = await page.title();
         if (/Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(newTitle)) {
@@ -168,6 +175,7 @@ const crawler = new PlaywrightCrawler({
       }
     }
 
+    // Dismiss modals
     for (const sel of ['button:has-text("Accept")', 'button:has-text("Continue")', 'button:has-text("Close")', 'button[aria-label="Close"]']) {
       try {
         const el = page.locator(sel).first();
@@ -175,7 +183,18 @@ const crawler = new PlaywrightCrawler({
       } catch(_) {}
     }
 
-    await page.waitForTimeout(2000);
+    // Wait for ticket prices to render
+    console.log('  Waiting for prices to render...');
+    try {
+      await page.waitForFunction(() => {
+        const text = document.body?.innerText || '';
+        return /\$\s*\d+/.test(text) && /listings?/i.test(text);
+      }, { timeout: 20000 });
+      console.log('  Prices detected.');
+    } catch(_) {
+      console.log('  Price wait timed out, extracting anyway...');
+      await page.waitForTimeout(5000);
+    }
 
     const html = await page.content();
     const canonicalUrl = extractCanonicalUrl(html, eventId);
@@ -205,6 +224,7 @@ const crawler = new PlaywrightCrawler({
       }
 
       const bodyText = document.body?.innerText || '';
+
       const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
         .map(m => parseInt(m[1].replace(/,/g, ''), 10))
         .filter(v => Number.isFinite(v) && v > 0);
@@ -236,8 +256,13 @@ const crawler = new PlaywrightCrawler({
     const date = normalizeDateString(data.date) || event.date || null;
     const { totalListings, prices } = data;
 
+    console.log(`  Listings found: ${totalListings}, Prices found: ${prices.length}`);
+
     const summary = summarizePrices(prices);
-    if (!summary.floor) { console.log(`  No pricing for ${name}`); return; }
+    if (!summary.floor) {
+      console.log(`  No pricing for ${name}`);
+      return;
+    }
 
     console.log(`  ${name} | ${date} | ${venue}`);
     console.log(`  ${totalListings} listings, floor $${summary.floor}, atp $${summary.avg}`);
