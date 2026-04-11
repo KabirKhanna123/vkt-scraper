@@ -115,9 +115,8 @@ async function dismissModals(page) {
   await page.evaluate(() => {
     const modal = document.querySelector('#modal-root');
     if (modal) modal.innerHTML = '';
-    document.querySelectorAll('[class*="overlay"], [class*="modal"]').forEach(el => {
-      const style = window.getComputedStyle(el);
-      if (style.position === 'fixed') el.remove();
+    document.querySelectorAll('[class*="overlay"]').forEach(el => {
+      if (window.getComputedStyle(el).position === 'fixed') el.remove();
     });
   });
   for (const sel of ['button:has-text("Accept")', 'button:has-text("Continue")', 'button:has-text("Close")', 'button[aria-label="Close"]', 'button:has-text("Got it")']) {
@@ -128,11 +127,28 @@ async function dismissModals(page) {
   }
 }
 
+async function waitForCategoryButtons(page, timeout = 15000) {
+  // Wait specifically for the StubHub zone chip buttons
+  try {
+    await page.waitForSelector('[data-testid="event-detail-zone-chip"]', { timeout });
+    return true;
+  } catch(_) {}
+
+  // Fallback: wait for any Category text in buttons
+  try {
+    await page.waitForFunction(
+      () => Array.from(document.querySelectorAll('button')).some(b => /^Category\s+\d/i.test((b.innerText || '').trim())),
+      { timeout: 5000 }
+    );
+    return true;
+  } catch(_) {}
+
+  return false;
+}
+
 async function extractPricesFromPage(page) {
   return await page.evaluate(({ minPrice, maxPrice }) => {
     const prices = new Set();
-
-    // Walk visible text nodes for $ prices
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let node;
     while ((node = walker.nextNode())) {
@@ -161,14 +177,45 @@ async function getListingCount(page) {
   });
 }
 
-// Inject fetch interceptor into page and capture the next ticketClasses URL
+async function getCategoryButtons(page) {
+  return await page.evaluate(() => {
+    // Try data-testid first (most reliable)
+    const chipBtns = Array.from(document.querySelectorAll('[data-testid="event-detail-zone-chip"]'));
+    if (chipBtns.length > 0) {
+      return chipBtns.map((b, i) => {
+        const aria = b.getAttribute('aria-label') || '';
+        const priceMatch = aria.match(/\$\s*([\d,]+)/);
+        const labelMatch = aria.match(/Category\s+\d+/i);
+        return {
+          label: labelMatch ? labelMatch[0] : `Category ${i+1}`,
+          floor: priceMatch ? parseFloat(priceMatch[1].replace(/,/g, '')) : null,
+          index: i
+        };
+      });
+    }
+
+    // Fallback: any button with Category text
+    return Array.from(document.querySelectorAll('button'))
+      .filter(b => /^Category\s+\d/i.test((b.innerText || '').trim()))
+      .map((b, i) => {
+        const aria = b.getAttribute('aria-label') || '';
+        const priceMatch = aria.match(/\$\s*([\d,]+)/);
+        return {
+          label: (b.innerText || '').trim().split('\n')[0].trim(),
+          floor: priceMatch ? parseFloat(priceMatch[1].replace(/,/g, '')) : null,
+          index: i
+        };
+      });
+  });
+}
+
 async function interceptNextCategoryUrl(page) {
   await page.evaluate(() => {
     window.__capturedCategoryUrl = null;
-    window.__origFetch = window.__origFetch || window.fetch;
+    if (!window.__origFetch) window.__origFetch = window.fetch;
     window.fetch = function(...args) {
       const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
-      if (url.includes('ticketClasses=') && url.includes('event') && !url.includes('google') && !url.includes('doubleclick')) {
+      if (url.includes('ticketClasses=') && (url.includes('/event/') || url.includes('stubhub')) && !url.includes('google') && !url.includes('doubleclick') && !url.includes('viagogo')) {
         window.__capturedCategoryUrl = url.startsWith('http') ? url : 'https://www.stubhub.com' + url;
       }
       return window.__origFetch.apply(this, args);
@@ -223,7 +270,7 @@ const crawler = new PlaywrightCrawler({
   browserPoolOptions: { useFingerprints: true },
   maxRequestRetries: 2,
   requestHandlerTimeoutSecs: 180,
-  navigationTimeoutSecs: 45,
+  navigationTimeoutSecs: 60,
 
   async requestHandler({ page, request }) {
     const { event } = request.userData;
@@ -239,29 +286,30 @@ const crawler = new PlaywrightCrawler({
       const shortUrl = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
       if (request.url !== shortUrl) {
         console.log('  Wrong page, retrying...');
-        await page.goto(shortUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.goto(shortUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.waitForTimeout(3000);
         const newTitle = await page.title();
         if (/Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(newTitle)) {
-          console.log('  Still wrong, skipping');
-          return;
+          console.log('  Still wrong, skipping'); return;
         }
       } else { return; }
     }
 
     await dismissModals(page);
 
-    // Wait for page to load
+    // Wait for listings AND category buttons
     console.log('  Waiting for page...');
     try {
-      await page.waitForFunction(() => {
-        const text = document.body?.innerText || '';
-        return /Category\s+\d/i.test(text) || (/\$\s*\d+/.test(text) && /listings?/i.test(text));
-      }, { timeout: 20000 });
+      await page.waitForFunction(() => /\$\s*\d+/.test(document.body?.innerText || '') && /listings?/i.test(document.body?.innerText || ''), { timeout: 25000 });
     } catch(_) { await page.waitForTimeout(5000); }
 
-    await page.waitForTimeout(1500);
+    // Extra wait to ensure category buttons render
+    await page.waitForTimeout(3000);
     await dismissModals(page);
+
+    // Wait specifically for category buttons
+    const hasCategories = await waitForCategoryButtons(page, 10000);
+    console.log(`  Category buttons detected: ${hasCategories}`);
 
     const html = await page.content();
     const canonicalUrl = extractCanonicalUrl(html, eventId);
@@ -297,21 +345,7 @@ const crawler = new PlaywrightCrawler({
     const venue = meta.venue || event.venue || null;
     const date = normalizeDateString(meta.date) || event.date || null;
     const totalListings = await getListingCount(page);
-
-    // Get category buttons with floor prices from aria-label
-    const categoryButtons = await page.evaluate(() => {
-      return Array.from(document.querySelectorAll('button'))
-        .filter(b => /^Category\s+\d/i.test((b.innerText || '').trim()))
-        .map((b, i) => {
-          const aria = b.getAttribute('aria-label') || '';
-          const priceMatch = aria.match(/\$\s*([\d,]+)/);
-          return {
-            label: (b.innerText || '').trim().split('\n')[0].trim(),
-            floor: priceMatch ? parseFloat(priceMatch[1].replace(/,/g, '')) : null,
-            index: i
-          };
-        });
-    });
+    const categoryButtons = await getCategoryButtons(page);
 
     console.log(`  ${categoryButtons.length} categories, ${totalListings} listings`);
 
@@ -321,63 +355,55 @@ const crawler = new PlaywrightCrawler({
     if (categoryButtons.length > 0) {
       for (const cat of categoryButtons) {
         try {
-          // Reset the interceptor
           await interceptNextCategoryUrl(page);
 
-          // JS click to trigger the fetch
+          // Click via JS to trigger the fetch
           await page.evaluate((idx) => {
-            const buttons = Array.from(document.querySelectorAll('button'))
-              .filter(b => /^Category\s+\d/i.test((b.innerText || '').trim()));
-            if (buttons[idx]) {
-              buttons[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            const chips = document.querySelectorAll('[data-testid="event-detail-zone-chip"]');
+            if (chips[idx]) {
+              chips[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+              return;
             }
+            // Fallback
+            const btns = Array.from(document.querySelectorAll('button'))
+              .filter(b => /^Category\s+\d/i.test((b.innerText || '').trim()));
+            if (btns[idx]) btns[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
           }, cat.index);
 
-          // Wait for fetch to fire
-          await page.waitForTimeout(2000);
-
-          // Get the captured URL
+          await page.waitForTimeout(2500);
           let categoryUrl = await getCapturedUrl(page);
 
           if (categoryUrl) {
-            console.log(`  ${cat.label}: navigating to filtered URL`);
+            console.log(`  ${cat.label}: navigating to filtered URL (ticketClasses=${new URL(categoryUrl).searchParams.get('ticketClasses')})`);
+            await page.goto(categoryUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            await page.waitForTimeout(3000);
+            await dismissModals(page);
 
-            // Navigate to the filtered category page
-            await page.goto(categoryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForTimeout(2000);
-
-            // Extract prices from this filtered view
             const catPrices = await extractPricesFromPage(page);
             const catListings = await getListingCount(page);
             const summary = summarizePrices(catPrices);
+            const floor = summary.floor || cat.floor;
 
-            console.log(`  ${cat.label}: ${catListings} listings, floor $${summary.floor || cat.floor}, atp $${summary.avg}, ceiling $${summary.ceiling} (${catPrices.length} prices)`);
-            categoryData.push({
-              label: cat.label,
-              listings: catListings,
-              floor: summary.floor || cat.floor,
-              avg: summary.avg,
-              ceiling: summary.ceiling
-            });
+            console.log(`  ${cat.label}: ${catListings} listings, floor $${floor}, atp $${summary.avg}, ceiling $${summary.ceiling} (${catPrices.length} prices)`);
+            categoryData.push({ label: cat.label, listings: catListings, floor, avg: summary.avg, ceiling: summary.ceiling });
 
-            // Navigate back to base event page
-            await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForTimeout(2000);
+            // Navigate back
+            await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 45000 });
+            await page.waitForTimeout(2500);
             await dismissModals(page);
+            await waitForCategoryButtons(page, 8000);
 
           } else {
-            // Fallback: use aria-label floor only
-            console.log(`  ${cat.label}: no URL captured, using floor from aria-label`);
+            console.log(`  ${cat.label}: no URL captured, using aria-label floor`);
             if (cat.floor) categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
           }
 
         } catch(e) {
           console.log(`  ${cat.label} error: ${e.message.slice(0, 80)}`);
           if (cat.floor) categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
-          // Try to navigate back
           try {
-            await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForTimeout(2000);
+            await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 45000 });
+            await page.waitForTimeout(2500);
             await dismissModals(page);
           } catch(_) {}
         }
@@ -405,7 +431,6 @@ const crawler = new PlaywrightCrawler({
     console.log(`  ${name} | ${date} | ${venue}`);
     console.log(`  ${totalListings} listings, floor $${eventSummary.floor}, atp $${eventSummary.avg}, ceiling $${eventSummary.ceiling}`);
 
-    // Post event snapshot
     await postSnapshot({
       eventId, eventName: name, eventDate: date, venue, platform: 'StubHub',
       totalListings, section: null, sectionListings: 0,
@@ -413,7 +438,6 @@ const crawler = new PlaywrightCrawler({
       source: 'apify'
     });
 
-    // Post category snapshots
     for (const cat of categoryData) {
       if (!cat.floor) continue;
       await postSnapshot({
@@ -426,7 +450,6 @@ const crawler = new PlaywrightCrawler({
       console.log(`  Saved ${cat.label}: floor $${cat.floor}, atp $${cat.avg}, ceiling $${cat.ceiling}`);
     }
 
-    // Update events table
     const updates = {};
     if (name !== originalName) updates.name = name;
     if (venue && venue !== event.venue) updates.venue = venue;
