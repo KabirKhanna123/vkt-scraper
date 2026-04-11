@@ -1,0 +1,16 @@
+{
+  "name": "vkt-stubhub-scraper",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "VKT StubHub event-level scraper",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "dependencies": {
+    "apify": "^3.0.0",
+    "crawlee": "^3.0.0",
+    "playwright": "^1.42.0",
+    "@supabase/supabase-js": "^2.39.0"
+  }
+}
