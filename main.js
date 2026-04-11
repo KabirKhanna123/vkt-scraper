@@ -78,7 +78,7 @@ async function getFifaEvents() {
   return data || [];
 }
 
-async function getOtherEvents(fifaIds, limit) {
+async function getOtherEvents(limit) {
   const { data, error } = await supabase
     .from('events')
     .select('id,name,date,venue,platform,is_major,stubhub_url')
@@ -109,6 +109,35 @@ async function postSnapshot(payload) {
     if (!r.ok) { console.error('Snapshot failed:', r.status, await r.text()); return false; }
     return true;
   } catch(e) { console.error('Snapshot error:', e.message); return false; }
+}
+
+async function dismissModals(page) {
+  // Close any modal overlays
+  await page.evaluate(() => {
+    // Remove modal-root overlays
+    const modal = document.querySelector('#modal-root');
+    if (modal) modal.innerHTML = '';
+    // Remove any fixed overlays
+    document.querySelectorAll('[class*="overlay"], [class*="modal"], [class*="Modal"]').forEach(el => {
+      const style = window.getComputedStyle(el);
+      if (style.position === 'fixed' || style.position === 'absolute') el.remove();
+    });
+  });
+
+  // Also try clicking close buttons
+  for (const sel of [
+    'button:has-text("Accept")', 'button:has-text("Continue")',
+    'button:has-text("Close")', 'button[aria-label="Close"]',
+    'button:has-text("Got it")', 'button:has-text("OK")'
+  ]) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 400 })) {
+        await el.click({ timeout: 700 });
+        await page.waitForTimeout(300);
+      }
+    } catch(_) {}
+  }
 }
 
 async function extractVisiblePrices(page) {
@@ -142,6 +171,19 @@ async function getListingCount(page) {
   });
 }
 
+// Click a category button using JS dispatchEvent to bypass overlays
+async function jsClick(page, index) {
+  return await page.evaluate((idx) => {
+    const buttons = Array.from(document.querySelectorAll('button'))
+      .filter(b => /^Category\s+\d/i.test((b.innerText || '').trim()));
+    if (buttons[idx]) {
+      buttons[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      return true;
+    }
+    return false;
+  }, index);
+}
+
 await Actor.init();
 
 const input = await Actor.getInput() || {};
@@ -154,19 +196,16 @@ if (manualEventId) {
     ? data
     : [{ id: manualEventId, name: 'Manual', date: null, venue: null, platform: 'StubHub', is_major: false, stubhub_url: null }];
 } else {
-  // Always pull ALL FIFA events first, then fill remaining slots with other events
   const fifaEvents = await getFifaEvents();
   const remainingSlots = Math.max(0, EVENT_LIMIT - fifaEvents.length);
-  const otherEvents = remainingSlots > 0 ? await getOtherEvents(fifaEvents.map(e => e.id), remainingSlots) : [];
+  const otherEvents = remainingSlots > 0 ? await getOtherEvents(remainingSlots) : [];
   events = [...fifaEvents, ...otherEvents];
-  console.log(`FIFA events: ${fifaEvents.length}, Other events: ${otherEvents.length}, Total: ${events.length}`);
+  console.log(`FIFA: ${fifaEvents.length}, Other: ${otherEvents.length}, Total: ${events.length}`);
 }
 
 const requests = [];
 for (const event of events) {
-  if (!manualEventId && await scrapedRecently(event.id)) {
-    continue;
-  }
+  if (!manualEventId && await scrapedRecently(event.id)) continue;
   requests.push({ url: buildUrl(event), userData: { event } });
 }
 
@@ -203,39 +242,34 @@ const crawler = new PlaywrightCrawler({
     if (/Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(title)) {
       const shortUrl = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
       if (request.url !== shortUrl) {
-        console.log('  Wrong page, retrying with short URL...');
+        console.log('  Wrong page, retrying...');
         await page.goto(shortUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
         await page.waitForTimeout(3000);
         const newTitle = await page.title();
         if (/Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(newTitle)) {
-          console.log('  Still wrong page, skipping');
+          console.log('  Still wrong, skipping');
           return;
         }
-      } else {
-        return;
-      }
+      } else { return; }
     }
 
     // Dismiss modals
-    for (const sel of ['button:has-text("Accept")', 'button:has-text("Continue")', 'button:has-text("Close")', 'button[aria-label="Close"]']) {
-      try {
-        const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 500 })) { await el.click({ timeout: 700 }); await page.waitForTimeout(300); }
-      } catch(_) {}
-    }
+    await dismissModals(page);
 
-    // Wait for page to load
+    // Wait for page
     console.log('  Waiting for page...');
     try {
       await page.waitForFunction(() => {
         const text = document.body?.innerText || '';
         return /Category\s+\d/i.test(text) || (/\$\s*\d+/.test(text) && /listings?/i.test(text));
       }, { timeout: 20000 });
-    } catch(_) {
-      await page.waitForTimeout(5000);
-    }
+    } catch(_) { await page.waitForTimeout(5000); }
 
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1500);
+
+    // Dismiss modals again after page settles
+    await dismissModals(page);
+    await page.waitForTimeout(500);
 
     const html = await page.content();
     const canonicalUrl = extractCanonicalUrl(html, eventId);
@@ -270,14 +304,22 @@ const crawler = new PlaywrightCrawler({
     if (name && name.toLowerCase().includes('tickets')) name = originalName;
     const venue = meta.venue || event.venue || null;
     const date = normalizeDateString(meta.date) || event.date || null;
-
     const totalListings = await getListingCount(page);
 
-    // Find category buttons
+    // Get category buttons info
     const categoryButtons = await page.evaluate(() => {
       return Array.from(document.querySelectorAll('button'))
         .filter(b => /^Category\s+\d/i.test((b.innerText || '').trim()))
-        .map(b => ({ label: (b.innerText || '').trim().split('\n')[0].trim() }));
+        .map((b, i) => ({
+          label: (b.innerText || '').trim().split('\n')[0].trim(),
+          // Extract floor price from aria-label: "Select Category 1 - $2,372"
+          floor: (() => {
+            const aria = b.getAttribute('aria-label') || '';
+            const m = aria.match(/\$\s*([\d,]+)/);
+            return m ? parseFloat(m[1].replace(/,/g, '')) : null;
+          })(),
+          index: i
+        }));
     });
 
     console.log(`  ${categoryButtons.length} categories, ${totalListings} listings`);
@@ -285,26 +327,34 @@ const crawler = new PlaywrightCrawler({
     const categoryData = [];
 
     if (categoryButtons.length > 0) {
-      // Click each category and extract prices
       for (const cat of categoryButtons) {
         try {
-          const btn = page.locator('button').filter({ hasText: new RegExp(`^${cat.label}`, 'i') }).first();
-          await btn.click({ timeout: 3000 });
-          console.log(`  Clicked ${cat.label}`);
+          // Use JS click to bypass modal overlay
+          const clicked = await jsClick(page, cat.index);
+          if (!clicked) { console.log(`  ${cat.label}: button not found`); continue; }
+
+          console.log(`  Clicked ${cat.label} (JS)`);
           await page.waitForTimeout(3000);
 
           const catPrices = await extractVisiblePrices(page);
           const catListings = await getListingCount(page);
           const summary = summarizePrices(catPrices);
 
-          console.log(`  ${cat.label}: ${catListings} listings, floor $${summary.floor}, atp $${summary.avg}, ceiling $${summary.ceiling} (${catPrices.length} prices)`);
-          categoryData.push({ label: cat.label, listings: catListings, ...summary });
+          // Use aria-label floor as the definitive floor if extraction misses it
+          const floor = summary.floor || cat.floor;
+          console.log(`  ${cat.label}: ${catListings} listings, floor $${floor}, atp $${summary.avg}, ceiling $${summary.ceiling} (${catPrices.length} prices)`);
+          categoryData.push({ label: cat.label, listings: catListings, floor, avg: summary.avg, ceiling: summary.ceiling });
 
-          // Deselect by clicking again
-          await btn.click({ timeout: 3000 }).catch(() => {});
-          await page.waitForTimeout(1500);
+          // Deselect
+          await jsClick(page, cat.index);
+          await page.waitForTimeout(1000);
+
         } catch(e) {
           console.log(`  ${cat.label} error: ${e.message}`);
+          // Still save the floor from aria-label
+          if (cat.floor) {
+            categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
+          }
         }
       }
     }
@@ -330,7 +380,7 @@ const crawler = new PlaywrightCrawler({
     console.log(`  ${name} | ${date} | ${venue}`);
     console.log(`  ${totalListings} listings, floor $${eventSummary.floor}, atp $${eventSummary.avg}, ceiling $${eventSummary.ceiling}`);
 
-    // Post event-level snapshot
+    // Post event snapshot
     await postSnapshot({
       eventId, eventName: name, eventDate: date, venue, platform: 'StubHub',
       totalListings, section: null, sectionListings: 0,
@@ -338,7 +388,7 @@ const crawler = new PlaywrightCrawler({
       source: 'apify'
     });
 
-    // Post per-category snapshots
+    // Post category snapshots
     for (const cat of categoryData) {
       if (!cat.floor) continue;
       await postSnapshot({
