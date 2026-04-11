@@ -1,0 +1,8 @@
+{
+  "actorSpecification": 1,
+  "name": "vkt-stubhub-scraper",
+  "title": "VKT StubHub Scraper",
+  "description": "Scrapes StubHub event pages",
+  "version": "1.0",
+  "buildTag": "latest"
+}
