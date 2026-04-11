@@ -68,11 +68,22 @@ function extractCanonicalUrl(html, eventId) {
   return null;
 }
 
-async function getEvents() {
+async function getFifaEvents() {
+  const { data, error } = await supabase
+    .from('events')
+    .select('id,name,date,venue,platform,is_major,stubhub_url')
+    .ilike('name', '%world cup%')
+    .order('date', { ascending: true });
+  if (error) { console.error('FIFA fetch error:', error.message); return []; }
+  return data || [];
+}
+
+async function getOtherEvents(fifaIds, limit) {
   const { data, error } = await supabase
     .from('events')
     .select('id,name,date,venue,platform,is_major,stubhub_url')
     .not('id', 'like', 'tm_%')
+    .not('name', 'ilike', '%world cup%')
     .not('name', 'ilike', '%football 2026 event%')
     .not('name', 'ilike', '%basketball 2026 event%')
     .not('name', 'ilike', '%baseball 2026 event%')
@@ -81,8 +92,8 @@ async function getEvents() {
     .not('name', 'ilike', '% tickets')
     .not('name', 'ilike', '%2026 event')
     .order('date', { ascending: true })
-    .limit(EVENT_LIMIT);
-  if (error) { console.error('Failed to fetch events:', error.message); return []; }
+    .limit(limit);
+  if (error) { console.error('Other events fetch error:', error.message); return []; }
   return data || [];
 }
 
@@ -100,6 +111,37 @@ async function postSnapshot(payload) {
   } catch(e) { console.error('Snapshot error:', e.message); return false; }
 }
 
+async function extractVisiblePrices(page) {
+  return await page.evaluate(({ minPrice, maxPrice }) => {
+    const prices = new Set();
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      try {
+        if (!node.parentElement) continue;
+        if (node.parentElement.closest('script,style,noscript,svg,header,footer,nav')) continue;
+        const style = window.getComputedStyle(node.parentElement);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+          const value = parseFloat(match[1].replace(/,/g, ''));
+          if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.add(value);
+        }
+      } catch(_) { continue; }
+    }
+    return [...prices].sort((a, b) => a - b);
+  }, { minPrice: MIN_PRICE, maxPrice: MAX_PRICE });
+}
+
+async function getListingCount(page) {
+  return await page.evaluate(() => {
+    const bodyText = document.body?.innerText || '';
+    const matches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
+      .map(m => parseInt(m[1].replace(/,/g, ''), 10))
+      .filter(v => Number.isFinite(v) && v > 0);
+    return matches.length ? Math.max(...matches) : 0;
+  });
+}
+
 await Actor.init();
 
 const input = await Actor.getInput() || {};
@@ -112,15 +154,17 @@ if (manualEventId) {
     ? data
     : [{ id: manualEventId, name: 'Manual', date: null, venue: null, platform: 'StubHub', is_major: false, stubhub_url: null }];
 } else {
-  events = await getEvents();
+  // Always pull ALL FIFA events first, then fill remaining slots with other events
+  const fifaEvents = await getFifaEvents();
+  const remainingSlots = Math.max(0, EVENT_LIMIT - fifaEvents.length);
+  const otherEvents = remainingSlots > 0 ? await getOtherEvents(fifaEvents.map(e => e.id), remainingSlots) : [];
+  events = [...fifaEvents, ...otherEvents];
+  console.log(`FIFA events: ${fifaEvents.length}, Other events: ${otherEvents.length}, Total: ${events.length}`);
 }
-
-console.log(`Events to process: ${events.length}`);
 
 const requests = [];
 for (const event of events) {
   if (!manualEventId && await scrapedRecently(event.id)) {
-    console.log(`Skipping ${event.name} (recent)`);
     continue;
   }
   requests.push({ url: buildUrl(event), userData: { event } });
@@ -180,7 +224,7 @@ const crawler = new PlaywrightCrawler({
       } catch(_) {}
     }
 
-    // Wait for category buttons or listings to appear
+    // Wait for page to load
     console.log('  Waiting for page...');
     try {
       await page.waitForFunction(() => {
@@ -196,11 +240,9 @@ const crawler = new PlaywrightCrawler({
     const html = await page.content();
     const canonicalUrl = extractCanonicalUrl(html, eventId);
 
-    // Extract everything from page
-    const data = await page.evaluate(({ minPrice, maxPrice }) => {
+    // Extract metadata
+    const meta = await page.evaluate(() => {
       let name = null, date = null, venue = null;
-
-      // JSON-LD metadata
       const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
       for (const script of scripts) {
         try {
@@ -221,104 +263,95 @@ const crawler = new PlaywrightCrawler({
         } catch(_) {}
         if (name && date && venue) break;
       }
+      return { name, date, venue };
+    });
 
-      // Total listings count
-      const bodyText = document.body?.innerText || '';
-      const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
-        .map(m => parseInt(m[1].replace(/,/g, ''), 10))
-        .filter(v => Number.isFinite(v) && v > 0);
-      const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
+    let name = meta.name || originalName;
+    if (name && name.toLowerCase().includes('tickets')) name = originalName;
+    const venue = meta.venue || event.venue || null;
+    const date = normalizeDateString(meta.date) || event.date || null;
 
-      // Extract category button prices — "Category 1\n\n$2,372"
-      const categoryPrices = [];
-      const buttons = Array.from(document.querySelectorAll('button'));
-      for (const btn of buttons) {
-        const text = (btn.innerText || '').trim();
-        if (/^Category\s+\d/i.test(text)) {
-          const priceMatch = text.match(/\$\s*([\d,]+(?:\.\d{2})?)/);
-          if (priceMatch) {
-            const price = parseFloat(priceMatch[1].replace(/,/g, ''));
-            if (Number.isFinite(price) && price >= minPrice && price <= maxPrice) {
-              categoryPrices.push({
-                label: text.split('\n')[0].trim(),
-                price
-              });
-            }
-          }
+    const totalListings = await getListingCount(page);
+
+    // Find category buttons
+    const categoryButtons = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('button'))
+        .filter(b => /^Category\s+\d/i.test((b.innerText || '').trim()))
+        .map(b => ({ label: (b.innerText || '').trim().split('\n')[0].trim() }));
+    });
+
+    console.log(`  ${categoryButtons.length} categories, ${totalListings} listings`);
+
+    const categoryData = [];
+
+    if (categoryButtons.length > 0) {
+      // Click each category and extract prices
+      for (const cat of categoryButtons) {
+        try {
+          const btn = page.locator('button').filter({ hasText: new RegExp(`^${cat.label}`, 'i') }).first();
+          await btn.click({ timeout: 3000 });
+          console.log(`  Clicked ${cat.label}`);
+          await page.waitForTimeout(3000);
+
+          const catPrices = await extractVisiblePrices(page);
+          const catListings = await getListingCount(page);
+          const summary = summarizePrices(catPrices);
+
+          console.log(`  ${cat.label}: ${catListings} listings, floor $${summary.floor}, atp $${summary.avg}, ceiling $${summary.ceiling} (${catPrices.length} prices)`);
+          categoryData.push({ label: cat.label, listings: catListings, ...summary });
+
+          // Deselect by clicking again
+          await btn.click({ timeout: 3000 }).catch(() => {});
+          await page.waitForTimeout(1500);
+        } catch(e) {
+          console.log(`  ${cat.label} error: ${e.message}`);
         }
       }
-
-      // Also collect all visible prices as fallback
-      const allPrices = new Set();
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-      let node;
-      while ((node = walker.nextNode())) {
-        try {
-          if (!node.parentElement) continue;
-          if (node.parentElement.closest('script,style,noscript,svg,header,footer,nav')) continue;
-          const style = window.getComputedStyle(node.parentElement);
-          if (style.display === 'none' || style.visibility === 'hidden') continue;
-          for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-            const value = parseFloat(match[1].replace(/,/g, ''));
-            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) allPrices.add(value);
-          }
-        } catch(_) { continue; }
-      }
-
-      return {
-        name, date, venue, totalListings,
-        categoryPrices,
-        allPrices: [...allPrices].sort((a, b) => a - b)
-      };
-    }, { minPrice: MIN_PRICE, maxPrice: MAX_PRICE });
-
-    let name = data.name || originalName;
-    if (name && name.toLowerCase().includes('tickets')) name = originalName;
-    const venue = data.venue || event.venue || null;
-    const date = normalizeDateString(data.date) || event.date || null;
-    const { totalListings, categoryPrices, allPrices } = data;
-
-    console.log(`  Category prices: ${JSON.stringify(categoryPrices)}`);
-    console.log(`  All visible prices: ${allPrices.length}`);
-
-    // Use category prices as primary source — they represent the 4 price tiers
-    // Floor = cheapest category, Ceiling = most expensive, ATP = average of all categories
-    let prices = [];
-    if (categoryPrices.length > 0) {
-      prices = categoryPrices.map(c => c.price);
-      console.log(`  Using ${prices.length} category prices`);
-    } else {
-      prices = allPrices;
-      console.log(`  Using ${prices.length} visible prices (no categories found)`);
     }
 
-    const summary = summarizePrices(prices);
-    if (!summary.floor) { console.log(`  No pricing for ${name}`); return; }
+    // Event-level summary
+    let eventSummary;
+    if (categoryData.length > 0) {
+      const floors = categoryData.map(c => c.floor).filter(Boolean);
+      const ceilings = categoryData.map(c => c.ceiling).filter(Boolean);
+      const atps = categoryData.map(c => c.avg).filter(Boolean);
+      eventSummary = {
+        floor: floors.length ? Math.min(...floors) : null,
+        avg: atps.length ? Math.round(atps.reduce((a,b) => a+b,0) / atps.length) : null,
+        ceiling: ceilings.length ? Math.max(...ceilings) : null,
+      };
+    } else {
+      const prices = await extractVisiblePrices(page);
+      eventSummary = summarizePrices(prices);
+    }
+
+    if (!eventSummary.floor) { console.log(`  No pricing for ${name}`); return; }
 
     console.log(`  ${name} | ${date} | ${venue}`);
-    console.log(`  ${totalListings} listings, floor $${summary.floor}, atp $${summary.avg}, ceiling $${summary.ceiling}`);
+    console.log(`  ${totalListings} listings, floor $${eventSummary.floor}, atp $${eventSummary.avg}, ceiling $${eventSummary.ceiling}`);
 
     // Post event-level snapshot
     await postSnapshot({
       eventId, eventName: name, eventDate: date, venue, platform: 'StubHub',
       totalListings, section: null, sectionListings: 0,
-      eventFloor: summary.floor, eventAvg: summary.avg, eventCeiling: summary.ceiling,
+      eventFloor: eventSummary.floor, eventAvg: eventSummary.avg, eventCeiling: eventSummary.ceiling,
       source: 'apify'
     });
 
-    // Post individual category snapshots
-    for (const cat of categoryPrices) {
+    // Post per-category snapshots
+    for (const cat of categoryData) {
+      if (!cat.floor) continue;
       await postSnapshot({
         eventId, eventName: name, eventDate: date, venue, platform: 'StubHub',
-        totalListings: 0, section: cat.label, sectionListings: 0,
-        sectionFloor: cat.price, sectionAvg: cat.price, sectionCeiling: cat.price,
-        eventFloor: summary.floor, eventAvg: summary.avg, eventCeiling: summary.ceiling,
+        totalListings: 0, section: cat.label, sectionListings: cat.listings,
+        sectionFloor: cat.floor, sectionAvg: cat.avg, sectionCeiling: cat.ceiling,
+        eventFloor: eventSummary.floor, eventAvg: eventSummary.avg, eventCeiling: eventSummary.ceiling,
         source: 'apify'
       });
-      console.log(`  Posted ${cat.label}: $${cat.price}`);
+      console.log(`  Saved ${cat.label}: floor $${cat.floor}, atp $${cat.avg}, ceiling $${cat.ceiling}`);
     }
 
-    // Save improvements to events table
+    // Update events table
     const updates = {};
     if (name !== originalName) updates.name = name;
     if (venue && venue !== event.venue) updates.venue = venue;
