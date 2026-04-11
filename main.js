@@ -27,11 +27,12 @@ function normalizeDateString(value) {
   return null;
 }
 
-function summarizePrices(prices) {
-  const valid = prices.map(safeNum).filter(v => v >= MIN_PRICE && v <= MAX_PRICE).sort((a,b) => a-b);
-  if (!valid.length) return { floor:null, avg:null, ceiling:null };
+function summarizeForAtpCeiling(prices, knownFloor) {
+  // Filter prices that are >= the known floor to avoid picking up stray low prices
+  const threshold = knownFloor ? knownFloor * 0.9 : MIN_PRICE;
+  const valid = prices.map(safeNum).filter(v => v >= threshold && v <= MAX_PRICE).sort((a,b) => a-b);
+  if (!valid.length) return { avg: null, ceiling: null };
   return {
-    floor:   Math.round(valid[0]),
     avg:     Math.round(valid.reduce((a,b) => a+b, 0) / valid.length),
     ceiling: Math.round(valid[valid.length-1])
   };
@@ -127,14 +128,11 @@ async function dismissModals(page) {
   }
 }
 
-async function waitForCategoryButtons(page, timeout = 15000) {
-  // Wait specifically for the StubHub zone chip buttons
+async function waitForCategoryButtons(page, timeout = 12000) {
   try {
     await page.waitForSelector('[data-testid="event-detail-zone-chip"]', { timeout });
     return true;
   } catch(_) {}
-
-  // Fallback: wait for any Category text in buttons
   try {
     await page.waitForFunction(
       () => Array.from(document.querySelectorAll('button')).some(b => /^Category\s+\d/i.test((b.innerText || '').trim())),
@@ -142,7 +140,6 @@ async function waitForCategoryButtons(page, timeout = 15000) {
     );
     return true;
   } catch(_) {}
-
   return false;
 }
 
@@ -179,12 +176,11 @@ async function getListingCount(page) {
 
 async function getCategoryButtons(page) {
   return await page.evaluate(() => {
-    // Try data-testid first (most reliable)
     const chipBtns = Array.from(document.querySelectorAll('[data-testid="event-detail-zone-chip"]'));
     if (chipBtns.length > 0) {
       return chipBtns.map((b, i) => {
         const aria = b.getAttribute('aria-label') || '';
-        const priceMatch = aria.match(/\$\s*([\d,]+)/);
+        const priceMatch = aria.match(/\$\s*([\d,]+(?:\.\d{2})?)/);
         const labelMatch = aria.match(/Category\s+\d+/i);
         return {
           label: labelMatch ? labelMatch[0] : `Category ${i+1}`,
@@ -193,13 +189,11 @@ async function getCategoryButtons(page) {
         };
       });
     }
-
-    // Fallback: any button with Category text
     return Array.from(document.querySelectorAll('button'))
       .filter(b => /^Category\s+\d/i.test((b.innerText || '').trim()))
       .map((b, i) => {
         const aria = b.getAttribute('aria-label') || '';
-        const priceMatch = aria.match(/\$\s*([\d,]+)/);
+        const priceMatch = aria.match(/\$\s*([\d,]+(?:\.\d{2})?)/);
         return {
           label: (b.innerText || '').trim().split('\n')[0].trim(),
           floor: priceMatch ? parseFloat(priceMatch[1].replace(/,/g, '')) : null,
@@ -297,24 +291,18 @@ const crawler = new PlaywrightCrawler({
 
     await dismissModals(page);
 
-    // Wait for listings AND category buttons
     console.log('  Waiting for page...');
     try {
       await page.waitForFunction(() => /\$\s*\d+/.test(document.body?.innerText || '') && /listings?/i.test(document.body?.innerText || ''), { timeout: 25000 });
     } catch(_) { await page.waitForTimeout(5000); }
 
-    // Extra wait to ensure category buttons render
     await page.waitForTimeout(3000);
     await dismissModals(page);
-
-    // Wait specifically for category buttons
-    const hasCategories = await waitForCategoryButtons(page, 10000);
-    console.log(`  Category buttons detected: ${hasCategories}`);
+    await waitForCategoryButtons(page, 10000);
 
     const html = await page.content();
     const canonicalUrl = extractCanonicalUrl(html, eventId);
 
-    // Extract metadata
     const meta = await page.evaluate(() => {
       let name = null, date = null, venue = null;
       const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
@@ -348,6 +336,9 @@ const crawler = new PlaywrightCrawler({
     const categoryButtons = await getCategoryButtons(page);
 
     console.log(`  ${categoryButtons.length} categories, ${totalListings} listings`);
+    if (categoryButtons.length > 0) {
+      console.log(`  Category floors from aria-label: ${categoryButtons.map(c => `${c.label}=$${c.floor}`).join(', ')}`);
+    }
 
     const categoryData = [];
     const baseUrl = request.url.split('?')[0];
@@ -357,35 +348,36 @@ const crawler = new PlaywrightCrawler({
         try {
           await interceptNextCategoryUrl(page);
 
-          // Click via JS to trigger the fetch
+          // Click to trigger the fetch URL
           await page.evaluate((idx) => {
             const chips = document.querySelectorAll('[data-testid="event-detail-zone-chip"]');
             if (chips[idx]) {
               chips[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
               return;
             }
-            // Fallback
             const btns = Array.from(document.querySelectorAll('button'))
               .filter(b => /^Category\s+\d/i.test((b.innerText || '').trim()));
             if (btns[idx]) btns[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
           }, cat.index);
 
           await page.waitForTimeout(2500);
-          let categoryUrl = await getCapturedUrl(page);
+          const categoryUrl = await getCapturedUrl(page);
 
           if (categoryUrl) {
-            console.log(`  ${cat.label}: navigating to filtered URL (ticketClasses=${new URL(categoryUrl).searchParams.get('ticketClasses')})`);
+            console.log(`  ${cat.label}: navigating (ticketClasses=${new URL(categoryUrl).searchParams.get('ticketClasses')})`);
             await page.goto(categoryUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
             await page.waitForTimeout(3000);
             await dismissModals(page);
 
             const catPrices = await extractPricesFromPage(page);
             const catListings = await getListingCount(page);
-            const summary = summarizePrices(catPrices);
-            const floor = summary.floor || cat.floor;
 
-            console.log(`  ${cat.label}: ${catListings} listings, floor $${floor}, atp $${summary.avg}, ceiling $${summary.ceiling} (${catPrices.length} prices)`);
-            categoryData.push({ label: cat.label, listings: catListings, floor, avg: summary.avg, ceiling: summary.ceiling });
+            // Use aria-label floor as definitive floor — it's the cheapest ticket in that category
+            const floor = cat.floor;
+            const { avg, ceiling } = summarizeForAtpCeiling(catPrices, floor);
+
+            console.log(`  ${cat.label}: ${catListings} listings, floor $${floor}, atp $${avg}, ceiling $${ceiling} (${catPrices.length} prices)`);
+            categoryData.push({ label: cat.label, listings: catListings, floor, avg, ceiling });
 
             // Navigate back
             await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 45000 });
@@ -394,13 +386,13 @@ const crawler = new PlaywrightCrawler({
             await waitForCategoryButtons(page, 8000);
 
           } else {
-            console.log(`  ${cat.label}: no URL captured, using aria-label floor`);
-            if (cat.floor) categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
+            console.log(`  ${cat.label}: no URL captured, storing floor only`);
+            categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
           }
 
         } catch(e) {
           console.log(`  ${cat.label} error: ${e.message.slice(0, 80)}`);
-          if (cat.floor) categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
+          categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
           try {
             await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 45000 });
             await page.waitForTimeout(2500);
@@ -410,7 +402,7 @@ const crawler = new PlaywrightCrawler({
       }
     }
 
-    // Event-level summary
+    // Event-level summary: floor = cheapest category floor, ceiling = highest ceiling across categories
     let eventSummary;
     if (categoryData.length > 0) {
       const floors = categoryData.map(c => c.floor).filter(Boolean);
@@ -423,7 +415,12 @@ const crawler = new PlaywrightCrawler({
       };
     } else {
       const prices = await extractPricesFromPage(page);
-      eventSummary = summarizePrices(prices);
+      const valid = prices.filter(p => p >= MIN_PRICE && p <= MAX_PRICE).sort((a,b) => a-b);
+      eventSummary = valid.length ? {
+        floor: Math.round(valid[0]),
+        avg: Math.round(valid.reduce((a,b) => a+b,0) / valid.length),
+        ceiling: Math.round(valid[valid.length-1])
+      } : { floor: null, avg: null, ceiling: null };
     }
 
     if (!eventSummary.floor) { console.log(`  No pricing for ${name}`); return; }
