@@ -100,151 +100,6 @@ async function postSnapshot(payload) {
   } catch(e) { console.error('Snapshot error:', e.message); return false; }
 }
 
-async function expandAllListings(page) {
-  console.log('  Expanding listings...');
-
-  const buttonTexts = ['Show more', 'See more', 'Load more', 'More listings', 'View more'];
-  let stableRounds = 0;
-  let lastRenderedCards = 0;
-  let lastScrollTop = -1;
-
-  for (let round = 0; round < 40; round++) {
-    let clickedShowMore = false;
-
-    // Click all visible show more buttons
-    for (const text of buttonTexts) {
-      try {
-        const buttons = page.locator(`button:has-text("${text}")`);
-        const count = await buttons.count();
-        for (let i = 0; i < count; i++) {
-          const btn = buttons.nth(i);
-          if (await btn.isVisible({ timeout: 300 })) {
-            console.log(`  Clicking "${text}"`);
-            await btn.click({ timeout: 2000, force: true });
-            clickedShowMore = true;
-            await page.waitForTimeout(2000);
-          }
-        }
-      } catch(_) {}
-    }
-
-    // Scroll the largest scrollable container
-    for (let i = 0; i < 6; i++) {
-      await page.evaluate(() => {
-        const all = Array.from(document.querySelectorAll('div, main, section, aside'));
-        let bestEl = null;
-        for (const el of all) {
-          const style = window.getComputedStyle(el);
-          if (style.display === 'none' || style.visibility === 'hidden') continue;
-          if (el.scrollHeight > el.clientHeight + 100) {
-            if (!bestEl || el.scrollHeight > bestEl.scrollHeight) bestEl = el;
-          }
-        }
-        if (bestEl) {
-          bestEl.scrollBy(0, Math.max(1200, Math.floor(bestEl.clientHeight * 0.9)));
-        } else {
-          window.scrollBy(0, 1400);
-        }
-      });
-      await page.waitForTimeout(1200);
-    }
-
-    // Check state
-    const newState = await page.evaluate(() => {
-      const all = Array.from(document.querySelectorAll('div, main, section, aside'));
-      let best = null;
-      for (const el of all) {
-        const style = window.getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden') continue;
-        if (el.scrollHeight > el.clientHeight + 100) {
-          if (!best || el.scrollHeight > best.scrollHeight) {
-            best = { scrollHeight: el.scrollHeight, clientHeight: el.clientHeight, scrollTop: el.scrollTop };
-          }
-        }
-      }
-      const renderedCards = document.querySelectorAll('[data-testid*="listing"], [class*="listing"], [class*="ListItem"], article').length;
-      const showMoreStillVisible = Array.from(document.querySelectorAll('button'))
-        .some(b => /show more|see more|load more|more listings|view more/i.test(b.innerText || ''));
-      return {
-        scrollTop: best ? best.scrollTop : window.scrollY,
-        scrollHeight: best ? best.scrollHeight : document.body.scrollHeight,
-        clientHeight: best ? best.clientHeight : window.innerHeight,
-        renderedCards,
-        showMoreStillVisible,
-      };
-    });
-
-    console.log(`  Round ${round + 1}: cards=${newState.renderedCards}, scrollTop=${newState.scrollTop}, showMore=${newState.showMoreStillVisible}`);
-
-    const cardsUnchanged = newState.renderedCards <= lastRenderedCards;
-    const scrollUnchanged = newState.scrollTop === lastScrollTop;
-    const nearBottom = newState.scrollTop + newState.clientHeight >= newState.scrollHeight - 50;
-
-    if (!clickedShowMore && cardsUnchanged && (scrollUnchanged || nearBottom) && !newState.showMoreStillVisible) {
-      stableRounds++;
-    } else {
-      stableRounds = 0;
-    }
-
-    lastRenderedCards = newState.renderedCards;
-    lastScrollTop = newState.scrollTop;
-
-    if (stableRounds >= 2) {
-      console.log('  Listings fully expanded');
-      break;
-    }
-  }
-}
-
-async function extractAllPrices(page, minPrice, maxPrice) {
-  return await page.evaluate(({ minPrice, maxPrice }) => {
-    const prices = new Set();
-
-    // Extract from embedded script JSON
-    for (const script of Array.from(document.querySelectorAll('script'))) {
-      const text = script.textContent || '';
-      if (text.length < 100) continue;
-      const patterns = [
-        /"price"\s*:\s*([\d.]+)/g,
-        /"currentPrice"\s*:\s*([\d.]+)/g,
-        /"listPrice"\s*:\s*([\d.]+)/g,
-        /"listingPrice"\s*:\s*([\d.]+)/g,
-        /"sellingPrice"\s*:\s*([\d.]+)/g,
-        /"amount"\s*:\s*([\d.]+)/g,
-        /"totalPrice"\s*:\s*([\d.]+)/g,
-        /"displayPrice"\s*:\s*([\d.]+)/g,
-        /"priceWithFees"\s*:\s*([\d.]+)/g,
-        /"faceValue"\s*:\s*([\d.]+)/g,
-        /"ticketPrice"\s*:\s*([\d.]+)/g,
-      ];
-      for (const pattern of patterns) {
-        for (const m of text.matchAll(pattern)) {
-          const v = parseFloat(m[1]);
-          if (Number.isFinite(v) && v >= minPrice && v <= maxPrice) prices.add(v);
-        }
-      }
-    }
-
-    // Walk visible text nodes
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) {
-      try {
-        if (!node.parentElement) continue;
-        if (node.parentElement.closest('script,style,noscript,svg,header,footer,nav')) continue;
-        const style = window.getComputedStyle(node.parentElement);
-        if (style.display === 'none' || style.visibility === 'hidden') continue;
-        for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-          const value = parseFloat(match[1].replace(/,/g, ''));
-          if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.add(value);
-        }
-      } catch(_) { continue; }
-    }
-
-    return [...prices].sort((a, b) => a - b);
-  }, { minPrice, maxPrice });
-}
-
 await Actor.init();
 
 const input = await Actor.getInput() || {};
@@ -288,7 +143,7 @@ const crawler = new PlaywrightCrawler({
 
   browserPoolOptions: { useFingerprints: true },
   maxRequestRetries: 2,
-  requestHandlerTimeoutSecs: 180,
+  requestHandlerTimeoutSecs: 120,
   navigationTimeoutSecs: 45,
 
   async requestHandler({ page, request }) {
@@ -297,32 +152,6 @@ const crawler = new PlaywrightCrawler({
     const originalName = event.name || 'Event ' + eventId;
 
     console.log(`\nScraping: ${originalName} (${eventId})`);
-
-    // Intercept network responses — log all JSON API endpoints
-    const networkPrices = new Set();
-    page.on('response', async (response) => {
-      try {
-        const url = response.url().toLowerCase();
-        const ct = response.headers()['content-type'] || '';
-        if (!ct.includes('application/json')) return;
-
-        // Log candidate endpoints
-        if (url.includes('inventory') || url.includes('listing') || url.includes('search') ||
-            url.includes('event') || url.includes('webapi') || url.includes('api') ||
-            url.includes('ticket') || url.includes('stub')) {
-          console.log(`  JSON: ${url.slice(0, 120)}`);
-        } else {
-          return;
-        }
-
-        const data = await response.json();
-        const text = JSON.stringify(data);
-        for (const m of text.matchAll(/"(?:price|currentPrice|listPrice|listingPrice|sellingPrice|displayPrice|priceWithFees|amount|faceValue|ticketPrice)"\s*:\s*([\d.]+)/g)) {
-          const v = parseFloat(m[1]);
-          if (Number.isFinite(v) && v >= MIN_PRICE && v <= MAX_PRICE) networkPrices.add(v);
-        }
-      } catch(_) {}
-    });
 
     const title = await page.title();
     console.log(`  Title: ${title.slice(0, 100)}`);
@@ -351,31 +180,27 @@ const crawler = new PlaywrightCrawler({
       } catch(_) {}
     }
 
-    // Wait for listings
-    console.log('  Waiting for listings...');
+    // Wait for category buttons or listings to appear
+    console.log('  Waiting for page...');
     try {
-      await page.waitForFunction(() => /\$\s*\d+/.test(document.body?.innerText || '') && /listings?/i.test(document.body?.innerText || ''), { timeout: 20000 });
+      await page.waitForFunction(() => {
+        const text = document.body?.innerText || '';
+        return /Category\s+\d/i.test(text) || (/\$\s*\d+/.test(text) && /listings?/i.test(text));
+      }, { timeout: 20000 });
     } catch(_) {
       await page.waitForTimeout(5000);
     }
 
-    // Expand all listings
-    await expandAllListings(page);
-    await page.waitForTimeout(1500);
-
-    // Debug: what's on the page
-    const debugInfo = await page.evaluate(() => ({
-      buttons: Array.from(document.querySelectorAll('button')).map(b => (b.innerText || '').trim()).filter(Boolean).slice(0, 30),
-      listingNodes: document.querySelectorAll('[data-testid*="listing"], [class*="listing"], [class*="ListItem"], article').length,
-    }));
-    console.log(`  Debug cards: ${debugInfo.listingNodes}, buttons: ${JSON.stringify(debugInfo.buttons.slice(0, 10))}`);
+    await page.waitForTimeout(2000);
 
     const html = await page.content();
     const canonicalUrl = extractCanonicalUrl(html, eventId);
 
-    // Extract metadata
-    const meta = await page.evaluate(() => {
+    // Extract everything from page
+    const data = await page.evaluate(({ minPrice, maxPrice }) => {
       let name = null, date = null, venue = null;
+
+      // JSON-LD metadata
       const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
       for (const script of scripts) {
         try {
@@ -396,25 +221,76 @@ const crawler = new PlaywrightCrawler({
         } catch(_) {}
         if (name && date && venue) break;
       }
+
+      // Total listings count
       const bodyText = document.body?.innerText || '';
       const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
         .map(m => parseInt(m[1].replace(/,/g, ''), 10))
         .filter(v => Number.isFinite(v) && v > 0);
       const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
-      return { name, date, venue, totalListings };
-    });
 
-    // Merge DOM + network prices
-    const domPrices = await extractAllPrices(page, MIN_PRICE, MAX_PRICE);
-    const prices = [...new Set([...domPrices, ...networkPrices])].sort((a, b) => a - b);
+      // Extract category button prices — "Category 1\n\n$2,372"
+      const categoryPrices = [];
+      const buttons = Array.from(document.querySelectorAll('button'));
+      for (const btn of buttons) {
+        const text = (btn.innerText || '').trim();
+        if (/^Category\s+\d/i.test(text)) {
+          const priceMatch = text.match(/\$\s*([\d,]+(?:\.\d{2})?)/);
+          if (priceMatch) {
+            const price = parseFloat(priceMatch[1].replace(/,/g, ''));
+            if (Number.isFinite(price) && price >= minPrice && price <= maxPrice) {
+              categoryPrices.push({
+                label: text.split('\n')[0].trim(),
+                price
+              });
+            }
+          }
+        }
+      }
 
-    let name = meta.name || originalName;
+      // Also collect all visible prices as fallback
+      const allPrices = new Set();
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        try {
+          if (!node.parentElement) continue;
+          if (node.parentElement.closest('script,style,noscript,svg,header,footer,nav')) continue;
+          const style = window.getComputedStyle(node.parentElement);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+          for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+            const value = parseFloat(match[1].replace(/,/g, ''));
+            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) allPrices.add(value);
+          }
+        } catch(_) { continue; }
+      }
+
+      return {
+        name, date, venue, totalListings,
+        categoryPrices,
+        allPrices: [...allPrices].sort((a, b) => a - b)
+      };
+    }, { minPrice: MIN_PRICE, maxPrice: MAX_PRICE });
+
+    let name = data.name || originalName;
     if (name && name.toLowerCase().includes('tickets')) name = originalName;
-    const venue = meta.venue || event.venue || null;
-    const date = normalizeDateString(meta.date) || event.date || null;
-    const { totalListings } = meta;
+    const venue = data.venue || event.venue || null;
+    const date = normalizeDateString(data.date) || event.date || null;
+    const { totalListings, categoryPrices, allPrices } = data;
 
-    console.log(`  Listings: ${totalListings}, DOM: ${domPrices.length}, Network: ${networkPrices.size}, Total: ${prices.length}`);
+    console.log(`  Category prices: ${JSON.stringify(categoryPrices)}`);
+    console.log(`  All visible prices: ${allPrices.length}`);
+
+    // Use category prices as primary source — they represent the 4 price tiers
+    // Floor = cheapest category, Ceiling = most expensive, ATP = average of all categories
+    let prices = [];
+    if (categoryPrices.length > 0) {
+      prices = categoryPrices.map(c => c.price);
+      console.log(`  Using ${prices.length} category prices`);
+    } else {
+      prices = allPrices;
+      console.log(`  Using ${prices.length} visible prices (no categories found)`);
+    }
 
     const summary = summarizePrices(prices);
     if (!summary.floor) { console.log(`  No pricing for ${name}`); return; }
@@ -422,6 +298,7 @@ const crawler = new PlaywrightCrawler({
     console.log(`  ${name} | ${date} | ${venue}`);
     console.log(`  ${totalListings} listings, floor $${summary.floor}, atp $${summary.avg}, ceiling $${summary.ceiling}`);
 
+    // Post event-level snapshot
     await postSnapshot({
       eventId, eventName: name, eventDate: date, venue, platform: 'StubHub',
       totalListings, section: null, sectionListings: 0,
@@ -429,6 +306,19 @@ const crawler = new PlaywrightCrawler({
       source: 'apify'
     });
 
+    // Post individual category snapshots
+    for (const cat of categoryPrices) {
+      await postSnapshot({
+        eventId, eventName: name, eventDate: date, venue, platform: 'StubHub',
+        totalListings: 0, section: cat.label, sectionListings: 0,
+        sectionFloor: cat.price, sectionAvg: cat.price, sectionCeiling: cat.price,
+        eventFloor: summary.floor, eventAvg: summary.avg, eventCeiling: summary.ceiling,
+        source: 'apify'
+      });
+      console.log(`  Posted ${cat.label}: $${cat.price}`);
+    }
+
+    // Save improvements to events table
     const updates = {};
     if (name !== originalName) updates.name = name;
     if (venue && venue !== event.venue) updates.venue = venue;
