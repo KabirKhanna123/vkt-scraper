@@ -103,79 +103,93 @@ async function postSnapshot(payload) {
 async function expandAllListings(page) {
   console.log('  Expanding listings...');
 
-  // Dismiss popups
-  for (const sel of ['button:has-text("Accept")', 'button:has-text("Continue")', 'button:has-text("Close")', 'button[aria-label="Close"]']) {
-    try {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 400 })) { await el.click({ timeout: 700 }); await page.waitForTimeout(300); }
-    } catch(_) {}
-  }
-
-  // Find listings scroll container
-  const scrollTarget = page.locator([
-    '[data-testid*="list"]',
-    '[data-testid*="inventory"]',
-    '#listings-container',
-    '[id*="listing"]',
-    '[class*="listing-container"]',
-    '[class*="inventory"]',
-    '[class*="scroll"]'
-  ].join(', ')).first();
-
-  let previousPriceCount = 0;
+  const buttonTexts = ['Show more', 'See more', 'Load more', 'More listings', 'View more'];
   let stableRounds = 0;
+  let lastRenderedCards = 0;
+  let lastScrollTop = -1;
 
-  for (let round = 0; round < 30; round++) {
-    // Click Show more buttons
-    for (const text of ['Show more', 'See more', 'Load more', 'More listings', 'View more']) {
+  for (let round = 0; round < 40; round++) {
+    let clickedShowMore = false;
+
+    // Click all visible show more buttons
+    for (const text of buttonTexts) {
       try {
-        const btn = page.locator(`button:has-text("${text}")`).first();
-        if (await btn.isVisible({ timeout: 400 })) {
-          console.log(`  Clicking "${text}"`);
-          await btn.click({ timeout: 1500 });
-          await page.waitForTimeout(1500);
+        const buttons = page.locator(`button:has-text("${text}")`);
+        const count = await buttons.count();
+        for (let i = 0; i < count; i++) {
+          const btn = buttons.nth(i);
+          if (await btn.isVisible({ timeout: 300 })) {
+            console.log(`  Clicking "${text}"`);
+            await btn.click({ timeout: 2000, force: true });
+            clickedShowMore = true;
+            await page.waitForTimeout(2000);
+          }
         }
       } catch(_) {}
     }
 
-    // Scroll listings container
-    let scrolled = false;
-    try {
-      if (await scrollTarget.isVisible({ timeout: 400 })) {
-        await scrollTarget.hover();
-        for (let i = 0; i < 4; i++) {
-          await scrollTarget.evaluate(el => el.scrollBy(0, Math.max(800, Math.floor(el.clientHeight * 0.9))));
-          await page.waitForTimeout(600);
+    // Scroll the largest scrollable container
+    for (let i = 0; i < 6; i++) {
+      await page.evaluate(() => {
+        const all = Array.from(document.querySelectorAll('div, main, section, aside'));
+        let bestEl = null;
+        for (const el of all) {
+          const style = window.getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+          if (el.scrollHeight > el.clientHeight + 100) {
+            if (!bestEl || el.scrollHeight > bestEl.scrollHeight) bestEl = el;
+          }
         }
-        scrolled = true;
-      }
-    } catch(_) {}
-
-    // Fallback: page scroll
-    if (!scrolled) {
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(800);
-      for (let i = 0; i < 3; i++) {
-        await page.mouse.wheel(0, 1200);
-        await page.waitForTimeout(600);
-      }
+        if (bestEl) {
+          bestEl.scrollBy(0, Math.max(1200, Math.floor(bestEl.clientHeight * 0.9)));
+        } else {
+          window.scrollBy(0, 1400);
+        }
+      });
+      await page.waitForTimeout(1200);
     }
 
-    // Count visible prices to detect when loading stops
-    const priceCount = await page.evaluate(() =>
-      [...(document.body?.innerText || '').matchAll(/\$\s*[\d,]+(?:\.\d{2})?/g)].length
-    );
+    // Check state
+    const newState = await page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll('div, main, section, aside'));
+      let best = null;
+      for (const el of all) {
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        if (el.scrollHeight > el.clientHeight + 100) {
+          if (!best || el.scrollHeight > best.scrollHeight) {
+            best = { scrollHeight: el.scrollHeight, clientHeight: el.clientHeight, scrollTop: el.scrollTop };
+          }
+        }
+      }
+      const renderedCards = document.querySelectorAll('[data-testid*="listing"], [class*="listing"], [class*="ListItem"], article').length;
+      const showMoreStillVisible = Array.from(document.querySelectorAll('button'))
+        .some(b => /show more|see more|load more|more listings|view more/i.test(b.innerText || ''));
+      return {
+        scrollTop: best ? best.scrollTop : window.scrollY,
+        scrollHeight: best ? best.scrollHeight : document.body.scrollHeight,
+        clientHeight: best ? best.clientHeight : window.innerHeight,
+        renderedCards,
+        showMoreStillVisible,
+      };
+    });
 
-    console.log(`  Round ${round + 1}: ${priceCount} price texts visible`);
+    console.log(`  Round ${round + 1}: cards=${newState.renderedCards}, scrollTop=${newState.scrollTop}, showMore=${newState.showMoreStillVisible}`);
 
-    if (priceCount <= previousPriceCount) {
+    const cardsUnchanged = newState.renderedCards <= lastRenderedCards;
+    const scrollUnchanged = newState.scrollTop === lastScrollTop;
+    const nearBottom = newState.scrollTop + newState.clientHeight >= newState.scrollHeight - 50;
+
+    if (!clickedShowMore && cardsUnchanged && (scrollUnchanged || nearBottom) && !newState.showMoreStillVisible) {
       stableRounds++;
     } else {
       stableRounds = 0;
-      previousPriceCount = priceCount;
     }
 
-    if (stableRounds >= 3) {
+    lastRenderedCards = newState.renderedCards;
+    lastScrollTop = newState.scrollTop;
+
+    if (stableRounds >= 2) {
       console.log('  Listings fully expanded');
       break;
     }
@@ -200,6 +214,8 @@ async function extractAllPrices(page, minPrice, maxPrice) {
         /"totalPrice"\s*:\s*([\d.]+)/g,
         /"displayPrice"\s*:\s*([\d.]+)/g,
         /"priceWithFees"\s*:\s*([\d.]+)/g,
+        /"faceValue"\s*:\s*([\d.]+)/g,
+        /"ticketPrice"\s*:\s*([\d.]+)/g,
       ];
       for (const pattern of patterns) {
         for (const m of text.matchAll(pattern)) {
@@ -282,17 +298,26 @@ const crawler = new PlaywrightCrawler({
 
     console.log(`\nScraping: ${originalName} (${eventId})`);
 
-    // Intercept network responses to capture all listing prices
+    // Intercept network responses — log all JSON API endpoints
     const networkPrices = new Set();
     page.on('response', async (response) => {
       try {
-        const url = response.url();
-        if (!url.includes('/inventory') && !url.includes('/listing') && !url.includes('/event') && !url.includes('/search')) return;
+        const url = response.url().toLowerCase();
         const ct = response.headers()['content-type'] || '';
         if (!ct.includes('application/json')) return;
+
+        // Log candidate endpoints
+        if (url.includes('inventory') || url.includes('listing') || url.includes('search') ||
+            url.includes('event') || url.includes('webapi') || url.includes('api') ||
+            url.includes('ticket') || url.includes('stub')) {
+          console.log(`  JSON: ${url.slice(0, 120)}`);
+        } else {
+          return;
+        }
+
         const data = await response.json();
         const text = JSON.stringify(data);
-        for (const m of text.matchAll(/"(?:price|currentPrice|listPrice|listingPrice|sellingPrice|amount|displayPrice|priceWithFees)"\s*:\s*([\d.]+)/g)) {
+        for (const m of text.matchAll(/"(?:price|currentPrice|listPrice|listingPrice|sellingPrice|displayPrice|priceWithFees|amount|faceValue|ticketPrice)"\s*:\s*([\d.]+)/g)) {
           const v = parseFloat(m[1]);
           if (Number.isFinite(v) && v >= MIN_PRICE && v <= MAX_PRICE) networkPrices.add(v);
         }
@@ -326,7 +351,7 @@ const crawler = new PlaywrightCrawler({
       } catch(_) {}
     }
 
-    // Wait for initial listings
+    // Wait for listings
     console.log('  Waiting for listings...');
     try {
       await page.waitForFunction(() => /\$\s*\d+/.test(document.body?.innerText || '') && /listings?/i.test(document.body?.innerText || ''), { timeout: 20000 });
@@ -337,6 +362,13 @@ const crawler = new PlaywrightCrawler({
     // Expand all listings
     await expandAllListings(page);
     await page.waitForTimeout(1500);
+
+    // Debug: what's on the page
+    const debugInfo = await page.evaluate(() => ({
+      buttons: Array.from(document.querySelectorAll('button')).map(b => (b.innerText || '').trim()).filter(Boolean).slice(0, 30),
+      listingNodes: document.querySelectorAll('[data-testid*="listing"], [class*="listing"], [class*="ListItem"], article').length,
+    }));
+    console.log(`  Debug cards: ${debugInfo.listingNodes}, buttons: ${JSON.stringify(debugInfo.buttons.slice(0, 10))}`);
 
     const html = await page.content();
     const canonicalUrl = extractCanonicalUrl(html, eventId);
@@ -382,7 +414,7 @@ const crawler = new PlaywrightCrawler({
     const date = normalizeDateString(meta.date) || event.date || null;
     const { totalListings } = meta;
 
-    console.log(`  Listings: ${totalListings}, DOM: ${domPrices.length}, Network: ${networkPrices.size}, Total prices: ${prices.length}`);
+    console.log(`  Listings: ${totalListings}, DOM: ${domPrices.length}, Network: ${networkPrices.size}, Total: ${prices.length}`);
 
     const summary = summarizePrices(prices);
     if (!summary.floor) { console.log(`  No pricing for ${name}`); return; }
