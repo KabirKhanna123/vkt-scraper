@@ -139,6 +139,65 @@ async function dismissModals(page) {
   }
 }
 
+async function turnOffRecommendedFilter(page) {
+  try {
+    // Method 1: Uncheck the "Recommended passes" checkbox directly
+    const unchecked = await page.evaluate(() => {
+      // Try aria-label first
+      const cb = document.querySelector('input[type="checkbox"][aria-label*="ecommended"]');
+      if (cb && cb.checked) { cb.click(); return 'aria-label checkbox'; }
+
+      // Try any checked checkbox near "recommended" text
+      const allCbs = document.querySelectorAll('input[type="checkbox"]');
+      for (const c of allCbs) {
+        const label = (c.getAttribute('aria-label') || c.closest('label')?.textContent || '').toLowerCase();
+        if (label.includes('recommend') && c.checked) { c.click(); return 'label checkbox'; }
+      }
+
+      // Try clicking a "Filters" button to open panel
+      return null;
+    });
+
+    if (unchecked) {
+      console.log(`  Turned off Recommended filter (${unchecked})`);
+      await page.waitForTimeout(800);
+      return;
+    }
+
+    // Method 2: Open filters panel and uncheck recommended
+    const filterBtn = page.locator('button:has-text("Filters"), button:has-text("Filter")').first();
+    if (await filterBtn.isVisible({ timeout: 2000 })) {
+      await filterBtn.click();
+      await page.waitForTimeout(600);
+
+      // Sort by Price
+      try {
+        const priceOption = page.locator('label:has-text("Price"), [role="radio"]:has-text("Price")').first();
+        if (await priceOption.isVisible({ timeout: 1000 })) await priceOption.click();
+      } catch(_) {}
+
+      // Uncheck recommended
+      try {
+        const recCb = page.locator('input[type="checkbox"][aria-label*="ecommended"]').first();
+        if (await recCb.isVisible({ timeout: 1000 })) {
+          const isChecked = await recCb.isChecked();
+          if (isChecked) { await recCb.click(); console.log('  Turned off Recommended (filter panel)'); }
+        }
+      } catch(_) {}
+
+      // Apply / close filter panel
+      try {
+        const applyBtn = page.locator('button:has-text("View"), button:has-text("Apply"), button:has-text("Done")').first();
+        if (await applyBtn.isVisible({ timeout: 1000 })) await applyBtn.click();
+      } catch(_) {}
+
+      await page.waitForTimeout(1000);
+    }
+  } catch(e) {
+    console.log(`  turnOffRecommendedFilter skipped: ${e.message.slice(0,50)}`);
+  }
+}
+
 async function waitForPrices(page, timeout=20000) {
   try { await page.waitForFunction(()=>/\$\s*\d+/.test(document.body?.innerText||'')&&/listings?/i.test(document.body?.innerText||''),{timeout}); } catch(_){}
 }
@@ -268,8 +327,11 @@ const crawler = new PlaywrightCrawler({
 
     await dismissModals(page);
     await waitForPrices(page, 20000);
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1000);
     await dismissModals(page);
+    // Turn off Recommended filter to see ALL listings
+    await turnOffRecommendedFilter(page);
+    await page.waitForTimeout(500);
     try { await page.waitForSelector('[data-testid="event-detail-zone-chip"]',{timeout:8000}); } catch(_){}
 
     const html = await page.content();
