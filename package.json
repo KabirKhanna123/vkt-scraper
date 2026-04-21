@@ -1,15 +1,13 @@
 {
-  "name": "vkt-stubhub-scraper",
+  "name": "vkt-volume-api",
   "version": "1.0.0",
-  "description": "VKT StubHub scraper for Apify",
-  "main": "main.js",
+  "description": "VKT Pricer volume tracking API",
+  "main": "index.js",
   "scripts": {
-    "start": "node main.js"
+    "dev": "vercel dev"
   },
   "dependencies": {
-    "playwright": "^1.43.0",
-    "playwright-extra": "^0.0.7",
-    "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "@supabase/supabase-js": "^2.43.0"
+    "@supabase/supabase-js": "^2.39.0",
+    "node-fetch": "^3.3.2"
   }
 }
