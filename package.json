@@ -1,7 +1,6 @@
 {
   "name": "vkt-stubhub-scraper",
   "version": "1.0.0",
-  "type": "module",
   "description": "VKT StubHub event-level scraper",
   "main": "main.js",
   "scripts": {
