@@ -1,15 +1,15 @@
 {
   "name": "vkt-stubhub-scraper",
   "version": "1.0.0",
-  "description": "VKT StubHub event-level scraper",
+  "description": "VKT StubHub scraper for Apify",
   "main": "main.js",
   "scripts": {
     "start": "node main.js"
   },
   "dependencies": {
-    "apify": "^3.0.0",
-    "crawlee": "^3.0.0",
-    "playwright": "^1.42.0",
-    "@supabase/supabase-js": "^2.39.0"
+    "playwright": "^1.43.0",
+    "playwright-extra": "^0.0.7",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "@supabase/supabase-js": "^2.43.0"
   }
 }
