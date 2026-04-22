@@ -7,7 +7,7 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6Ik
 const VKT_API = process.env.VKT_API || 'https://vkt-volume-api.vercel.app';
 
 const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
-const FIFA_EVENT_LIMIT = parseInt(process.env.FIFA_EVENT_LIMIT || '80', 10);
+const FIFA_EVENT_LIMIT = parseInt(process.env.FIFA_EVENT_LIMIT || '104', 10);
 const MIN_PRICE = 10;
 const MAX_PRICE = 25000;
 
