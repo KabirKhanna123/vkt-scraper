@@ -7,6 +7,8 @@
     "start": "node main.js"
   },
   "dependencies": {
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "@supabase/supabase-js": "^2.43.0"
   }
 }
