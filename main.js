@@ -1,7 +1,8 @@
-// VKT StubHub Scraper v4
-// Fetches raw HTML via BrightData Web Unlocker, then extracts prices
-// directly from StubHub's embedded JSON (__NEXT_DATA__ / script tags).
-// No browser rendering needed — same technique as VKT Pricer extension.
+// VKT StubHub Scraper v5
+// Fixes:
+// 1. Pagination — fetches ALL listings via StubHub's internal listing API
+// 2. Category extraction — broader JSON walk to find category floor data
+// 3. Better total listing count from API response
 
 const { createClient } = require('@supabase/supabase-js');
 
@@ -85,40 +86,146 @@ function summarizePrices(prices) {
   };
 }
 
-// ── Core: extract all data from raw HTML ──────────────────────────────────────
-// Same approach as VKT Pricer (content.js scrapeStubHubFromScripts).
-// StubHub embeds complete listing data as JSON in <script> tags.
-// We parse it directly from the HTML string — no browser needed.
+// ── BrightData fetch ──────────────────────────────────────────────────────────
 
-function extractFromRawHtml(html, eventId) {
-  const prices    = [];
-  let name        = null;
-  let date        = null;
-  let venue       = null;
+async function fetchWithWebUnlocker(targetUrl) {
+  try {
+    const res = await fetch('https://api.brightdata.com/request', {
+      method:  'POST',
+      headers: {
+        'Authorization': 'Bearer ' + BRIGHTDATA_API_TOKEN,
+        'Content-Type':  'application/json'
+      },
+      body: JSON.stringify({
+        zone:    WEB_UNLOCKER_ZONE,
+        url:     targetUrl,
+        format:  'raw',
+        headers: {
+          'Accept':          'text/html,application/xhtml+xml,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'User-Agent':      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        }
+      })
+    });
+    const text = await res.text();
+    if (!res.ok) { console.error('  BrightData error:', res.status); return null; }
+    try {
+      const json = JSON.parse(text);
+      return json.body || json.html || json.content || null;
+    } catch (_) {}
+    return text;
+  } catch (e) {
+    console.error('  Fetch error:', e.message);
+    return null;
+  }
+}
+
+// ── Fetch all listings via StubHub's internal JSON API ─────────────────────────
+// StubHub exposes a paginated listing endpoint that returns full listing data.
+// This gives us ALL listings — not just the 10 embedded in __NEXT_DATA__.
+
+async function fetchAllListings(eventId) {
+  const allPrices = [];
+  // Category map: section/category name -> array of prices
+  const categoryPrices = {};
   let totalListings = 0;
+  let page = 1;
+  const perPage = 200;
 
-  // ── 1. Extract from embedded JSON (window.__NEXT_DATA__ and similar) ──────
-  // Find all <script> blocks that contain price-related fields
+  while (true) {
+    const apiUrl = `https://www.stubhub.com/api/event/${eventId}/listings?quantity=0&rows=${perPage}&start=${(page - 1) * perPage}`;
+    const html = await fetchWithWebUnlocker(apiUrl);
+    if (!html) break;
+
+    let data = null;
+    try { data = JSON.parse(html); } catch (_) {}
+
+    // StubHub may return HTML instead of JSON for some requests
+    // In that case, fall back to extracting from whatever we got
+    if (!data || typeof data !== 'object') {
+      // Try extracting JSON from response text
+      const jsonMatch = html.match(/\{[\s\S]{100,}\}/);
+      if (jsonMatch) {
+        try { data = JSON.parse(jsonMatch[0]); } catch (_) {}
+      }
+    }
+
+    if (!data) break;
+
+    // Extract total count
+    if (data.totalListings) totalListings = Math.max(totalListings, data.totalListings);
+    if (data.numFound)      totalListings = Math.max(totalListings, data.numFound);
+    if (data.total)         totalListings = Math.max(totalListings, data.total);
+
+    // Extract listings
+    const listings = data.listing || data.listings || data.items || [];
+    if (!Array.isArray(listings) || !listings.length) break;
+
+    for (const l of listings) {
+      // Price fields StubHub uses
+      const price = l.currentPrice?.amount
+        ?? l.buyerPrice?.amount
+        ?? l.currentPrice
+        ?? l.listingPrice
+        ?? l.price
+        ?? l.pricePerTicket;
+
+      const v = parseFloat(String(price || '').replace(/[^0-9.]/g, ''));
+      if (Number.isFinite(v) && v >= MIN_PRICE && v <= MAX_PRICE) {
+        allPrices.push(v);
+
+        // Track by section/category
+        const section = l.section || l.sectionName || l.category || l.categoryName || '';
+        if (section) {
+          const key = String(section).trim();
+          if (!categoryPrices[key]) categoryPrices[key] = [];
+          categoryPrices[key].push(v);
+        }
+      }
+    }
+
+    // If we got fewer than a full page, we're done
+    if (listings.length < perPage) break;
+    // If we've scraped all listings, stop
+    if (totalListings > 0 && allPrices.length >= totalListings) break;
+    // Safety cap — don't scrape more than 2000 listings
+    if (allPrices.length >= 2000) break;
+
+    page++;
+    await sleep(500); // small pause between pages
+  }
+
+  return { allPrices, categoryPrices, totalListings };
+}
+
+// ── Extract data from the event page HTML ─────────────────────────────────────
+// Gets metadata (name, date, venue), listing count, and initial prices.
+// Also extracts category floor data from embedded JSON.
+
+function extractFromPageHtml(html) {
+  let name  = null;
+  let date  = null;
+  let venue = null;
+  let totalListings = 0;
+  const prices     = [];
+  const categories = [];
+
+  // ── 1. Walk all script tags for embedded JSON ─────────────────────────────
   const scriptMatches = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)];
 
   for (const match of scriptMatches) {
     const text = match[1] || '';
-    if (!text.includes('"price"') &&
-        !text.includes('"currentPrice"') &&
-        !text.includes('"listingPrice"') &&
-        !text.includes('"sellerAllInPrice"')) continue;
     if (text.length < 200) continue;
 
     let json = null;
 
-    // Strategy A: window.__NEXT_DATA__
+    // Try __NEXT_DATA__ first
     const nextMatch = text.match(/window\.__NEXT_DATA__\s*=\s*(\{[\s\S]*?\});?\s*(?:window\.|<\/script>|$)/);
     if (nextMatch) {
       try { json = JSON.parse(nextMatch[1]); } catch (_) {}
     }
-
-    // Strategy B: any large JSON blob in the script tag
-    if (!json) {
+    // Fallback: any large JSON blob
+    if (!json && (text.includes('"price"') || text.includes('"currentPrice"') || text.includes('"minPrice"'))) {
       const blobs = [...text.matchAll(/(\{[\s\S]{200,}\})/g)];
       for (const blob of blobs) {
         try { json = JSON.parse(blob[1]); break; } catch (_) {}
@@ -127,36 +234,88 @@ function extractFromRawHtml(html, eventId) {
 
     if (!json) continue;
 
-    // Recursively walk JSON to find listing objects with prices
-    function walk(obj, depth) {
-      if (depth > 12 || !obj || typeof obj !== 'object') return;
+    // ── Walk JSON for prices AND category data ─────────────────────────────
+    function walk(obj, depth, parentKey) {
+      if (depth > 15 || !obj || typeof obj !== 'object') return;
       if (Array.isArray(obj)) {
-        obj.forEach(item => walk(item, depth + 1));
+        obj.forEach(item => walk(item, depth + 1, parentKey));
         return;
       }
+
+      const keys = Object.keys(obj);
+
+      // Detect category-level price objects
+      // StubHub uses keys like: categoryName, seatCategory, ticketClass, zone
+      const catKey = obj.categoryName || obj.seatCategory || obj.ticketClassName
+        || obj.zone || obj.section || obj.categoryLabel || obj.label;
+      const minPriceRaw = obj.minPrice ?? obj.floorPrice ?? obj.cheapestPrice
+        ?? obj.lowestPrice ?? obj.startingPrice;
+
+      if (catKey && minPriceRaw !== undefined) {
+        const catName = String(catKey).trim();
+        const floor   = parseFloat(String(minPriceRaw).replace(/[^0-9.]/g, ''));
+        if (catName && Number.isFinite(floor) && floor >= MIN_PRICE && floor <= MAX_PRICE) {
+          if (!categories.find(c => c.name === catName)) {
+            categories.push({ name: catName, floor: Math.round(floor) });
+          }
+        }
+      }
+
+      // Also detect numeric category IDs (Category 1, Category 2, etc.)
+      const catId = obj.ticketClassId ?? obj.categoryId ?? obj.seatTypeId;
+      if (catId !== undefined && minPriceRaw !== undefined) {
+        const num   = parseInt(String(catId), 10);
+        const floor = parseFloat(String(minPriceRaw).replace(/[^0-9.]/g, ''));
+        if (num >= 1 && num <= 10 && Number.isFinite(floor) && floor >= MIN_PRICE && floor <= MAX_PRICE) {
+          const catName = `Category ${num}`;
+          if (!categories.find(c => c.name === catName)) {
+            categories.push({ name: catName, floor: Math.round(floor) });
+          }
+        }
+      }
+
+      // Extract listing prices
       const raw = obj.currentPrice ?? obj.price ?? obj.listingPrice ?? obj.sellerAllInPrice;
       if (raw !== undefined) {
         const v = parseFloat(String(raw).replace(/[^0-9.]/g, ''));
-        if (Number.isFinite(v) && v >= MIN_PRICE && v <= MAX_PRICE) {
-          prices.push(v);
-        }
+        if (Number.isFinite(v) && v >= MIN_PRICE && v <= MAX_PRICE) prices.push(v);
       }
-      Object.values(obj).forEach(val => walk(val, depth + 1));
+
+      keys.forEach(k => walk(obj[k], depth + 1, k));
     }
 
-    walk(json, 0);
-    if (prices.length > 0) break; // found prices — stop scanning scripts
+    walk(json, 0, '');
   }
 
-  // ── 2. Extract event metadata from JSON-LD ────────────────────────────────
-  const jsonLdMatches = [...html.matchAll(/<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi)];
-  for (const match of jsonLdMatches) {
+  // ── 2. Category floors from aria-label patterns in SVG map ───────────────
+  // StubHub's venue map has aria-labels like "Category 1 from $500"
+  const ariaPatterns = [
+    /aria-label="[^"]*?(?:Category|Cat\.?)\s+(\d+)[^"]*?(?:from\s+)?\$\s*([\d,]+)/gi,
+    /data-label="[^"]*?(?:Category|Cat\.?)\s+(\d+)[^"]*?(?:from\s+)?\$\s*([\d,]+)/gi,
+    /"label"\s*:\s*"(?:Category|Cat\.?)\s+(\d+)[^"]*?"\s*[^}]*?"(?:minPrice|floor|price)"\s*:\s*([\d.]+)/gi,
+  ];
+
+  for (const pattern of ariaPatterns) {
+    for (const m of html.matchAll(pattern)) {
+      const catNum = parseInt(m[1], 10);
+      const floor  = parseInt(m[2].replace(/,/g, ''), 10);
+      const catName = `Category ${catNum}`;
+      if (catNum >= 1 && catNum <= 10 && floor >= MIN_PRICE && floor <= MAX_PRICE) {
+        if (!categories.find(c => c.name === catName)) {
+          categories.push({ name: catName, floor });
+        }
+      }
+    }
+  }
+
+  // ── 3. JSON-LD metadata ───────────────────────────────────────────────────
+  for (const match of html.matchAll(/<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi)) {
     try {
       const items = [].concat(JSON.parse(match[1]));
       for (const item of items) {
         if (!item || (item['@type'] !== 'Event' && item['@type'] !== 'SportsEvent')) continue;
-        if (!name && item.name && !item.name.toLowerCase().includes('tickets')) name = item.name;
-        if (!date && item.startDate) date = item.startDate;
+        if (!name  && item.name      && !item.name.toLowerCase().includes('tickets')) name = item.name;
+        if (!date  && item.startDate) date = item.startDate;
         if (!venue && item.location?.name) {
           const city  = item.location.address?.addressLocality || '';
           const state = item.location.address?.addressRegion   || '';
@@ -168,53 +327,24 @@ function extractFromRawHtml(html, eventId) {
     if (name && date && venue) break;
   }
 
-  // ── 3. Extract listing count from raw text ────────────────────────────────
+  // ── 4. Total listing count from page text ─────────────────────────────────
   const listingMatches = [...html.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
     .map(m => parseInt(m[1].replace(/,/g, ''), 10))
     .filter(v => Number.isFinite(v) && v > 0);
-  totalListings = listingMatches.length ? Math.max(...listingMatches) : prices.length;
+  totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
 
-  // ── 4. Fallback: regex price scan on raw HTML text ────────────────────────
-  // Used when StubHub doesn't embed JSON (rare) — scan for $XXX patterns
+  // ── 5. Fallback: regex price scan ────────────────────────────────────────
   if (prices.length === 0) {
-    const priceMatches = [...html.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)];
-    for (const m of priceMatches) {
+    for (const m of html.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
       const v = parseFloat(m[1].replace(/,/g, ''));
-      if (Number.isFinite(v) && v >= MIN_PRICE && v <= MAX_PRICE) {
-        prices.push(v);
-      }
+      if (Number.isFinite(v) && v >= MIN_PRICE && v <= MAX_PRICE) prices.push(v);
     }
   }
 
-  // ── 5. Extract category floors (from aria-labels or JSON) ─────────────────
-  const categories = [];
-  const ariaMatches = [...html.matchAll(/aria-label="[^"]*?Category\s+(\d+)[^"]*?\$\s*([\d,]+)/gi)];
-  for (const m of ariaMatches) {
-    const catNum = parseInt(m[1], 10);
-    const floor  = parseInt(m[2].replace(/,/g, ''), 10);
-    if (catNum >= 1 && catNum <= 10 && floor >= MIN_PRICE && floor <= MAX_PRICE) {
-      if (!categories.find(c => c.category === catNum)) {
-        categories.push({ category: catNum, floor });
-      }
-    }
-  }
-  if (!categories.length) {
-    const catMatches = [...html.matchAll(/"ticketClass(?:Name|Id)?"\s*:\s*"?(\d+)"?[^}]*?"minPrice"\s*:\s*([\d.]+)/gi)];
-    for (const m of catMatches) {
-      const catNum = parseInt(m[1], 10);
-      const floor  = Math.round(parseFloat(m[2]));
-      if (catNum >= 1 && catNum <= 4 && floor >= MIN_PRICE && floor <= MAX_PRICE) {
-        if (!categories.find(c => c.category === catNum)) {
-          categories.push({ category: catNum, floor });
-        }
-      }
-    }
-  }
-
-  return { prices, name, date, venue, totalListings, categories };
+  return { name, date, venue, totalListings, prices, categories };
 }
 
-// ── URL builders ──────────────────────────────────────────────────────────────
+// ── URL helpers ───────────────────────────────────────────────────────────────
 
 function buildStubHubUrl(event) {
   if (event.stubhub_url) {
@@ -226,8 +356,7 @@ function buildStubHubUrl(event) {
       const nameSlug = event.name
         .toLowerCase()
         .replace(/\s+at\s+/i, ' ')
-        .replace(/[^a-z0-9\s]/g, '')
-        .trim()
+        .replace(/[^a-z0-9\s]/g, '').trim()
         .replace(/\s+/g, '-');
       let citySlug = '';
       if (event.venue) {
@@ -251,7 +380,7 @@ function buildStubHubUrl(event) {
 function extractCanonicalUrl(html, eventId) {
   const og  = html.match(/<meta[^>]+property="og:url"[^>]+content="([^"]+)"/i)
            || html.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:url"/i);
-  if (og  && og[1].includes(eventId)) return og[1].split('?')[0];
+  if (og  && og[1].includes(eventId))  return og[1].split('?')[0];
   const can = html.match(/<link[^>]+rel="canonical"[^>]+href="([^"]+)"/i)
             || html.match(/<link[^>]+href="([^"]+)"[^>]+rel="canonical"/i);
   if (can && can[1].includes(eventId)) return can[1].split('?')[0];
@@ -310,43 +439,7 @@ async function postSnapshot(payload) {
   } catch (e) { console.error('  Snapshot error:', e.message); return false; }
 }
 
-// ── BrightData fetch ──────────────────────────────────────────────────────────
-
-async function fetchWithWebUnlocker(targetUrl) {
-  try {
-    const res = await fetch('https://api.brightdata.com/request', {
-      method:  'POST',
-      headers: {
-        'Authorization': 'Bearer ' + BRIGHTDATA_API_TOKEN,
-        'Content-Type':  'application/json'
-      },
-      body: JSON.stringify({
-        zone:    WEB_UNLOCKER_ZONE,
-        url:     targetUrl,
-        format:  'raw',
-        headers: {
-          'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'User-Agent':      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        }
-      })
-    });
-    const text = await res.text();
-    if (!res.ok) { console.error('  BrightData error:', res.status); return null; }
-    try {
-      const json = JSON.parse(text);
-      return json.body || json.html || json.content || null;
-    } catch (_) {}
-    return text;
-  } catch (e) {
-    console.error('  Fetch error:', e.message);
-    return null;
-  }
-}
-
 // ── Worker ────────────────────────────────────────────────────────────────────
-// Pure fetch + parse — no browser, no Playwright rendering.
-// Processes events concurrently from the shared queue array.
 
 async function worker(workerId, queue, results) {
   while (true) {
@@ -360,11 +453,10 @@ async function worker(workerId, queue, results) {
     console.log(`[W${workerId}][${tier.label}] ${origName} (${eventId})`);
 
     try {
-      // ── Fetch raw HTML via BrightData ────────────────────────────────────
-      const url  = buildStubHubUrl(event);
-      let html   = await fetchWithWebUnlocker(url);
+      // ── Fetch event page HTML ─────────────────────────────────────────────
+      const url = buildStubHubUrl(event);
+      let html  = await fetchWithWebUnlocker(url);
 
-      // Fallback to short URL if page doesn't contain our event ID
       if (!isCorrectEventPage(html, eventId)) {
         const shortUrl = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
         if (shortUrl !== url) html = await fetchWithWebUnlocker(shortUrl);
@@ -376,24 +468,56 @@ async function worker(workerId, queue, results) {
         continue;
       }
 
-      // ── Extract all data from raw HTML (no browser needed) ───────────────
-      const extracted = extractFromRawHtml(html, eventId);
-      const { prices, categories, totalListings } = extracted;
-
-      let name  = extracted.name  || origName;
+      // ── Extract metadata + initial prices + categories from HTML ──────────
+      const pageData = extractFromPageHtml(html);
+      let name  = pageData.name  || origName;
       if (name.toLowerCase().includes('tickets')) name = origName;
-      const venue = extracted.venue || event.venue || null;
-      const date  = normalizeDateString(extracted.date) || event.date || null;
+      const venue = pageData.venue || event.venue || null;
+      const date  = normalizeDateString(pageData.date) || event.date || null;
+      let categories = pageData.categories;
 
-      const summary = summarizePrices(prices);
+      // ── Fetch ALL listings via StubHub's listing API ──────────────────────
+      // This gives us the full price distribution, not just the first 10.
+      const listingData = await fetchAllListings(eventId);
+
+      let allPrices    = listingData.allPrices;
+      let totalListings = listingData.totalListings || pageData.totalListings;
+      const categoryPrices = listingData.categoryPrices;
+
+      // Fall back to page prices if API call yielded nothing
+      if (allPrices.length === 0) allPrices = pageData.prices;
+      if (totalListings === 0)     totalListings = allPrices.length;
+
+      const summary = summarizePrices(allPrices);
 
       if (!summary.floor) {
-        console.log(`[W${workerId}] ✗ No pricing for ${name} (${prices.length} raw prices found)`);
+        console.log(`[W${workerId}] ✗ No pricing for ${name}`);
         results.failed++;
         continue;
       }
 
-      console.log(`[W${workerId}] ✓ ${name} | ${totalListings} listings, floor $${summary.floor}, avg $${summary.avg}, ceiling $${summary.ceiling}${categories.length ? ' | cats: ' + categories.map(c => `Cat${c.category}=$${c.floor}`).join(' ') : ''}`);
+      // ── Build category data ────────────────────────────────────────────────
+      // From API section breakdown (if we got it)
+      if (Object.keys(categoryPrices).length > 0 && categories.length === 0) {
+        for (const [section, sectionPrices] of Object.entries(categoryPrices)) {
+          const sFloor = Math.min(...sectionPrices);
+          if (sFloor >= MIN_PRICE && sFloor <= MAX_PRICE) {
+            categories.push({ name: section, floor: Math.round(sFloor) });
+          }
+        }
+        // Keep only category-style sections (Category 1, Category 2, etc.)
+        categories = categories.filter(c =>
+          /^category\s*\d+$/i.test(c.name) ||
+          /^cat\.?\s*\d+$/i.test(c.name)   ||
+          /^hospitality/i.test(c.name)
+        );
+      }
+
+      const catLog = categories.length
+        ? ' | cats: ' + categories.map(c => `${c.name}=$${c.floor}`).join(', ')
+        : '';
+
+      console.log(`[W${workerId}] ✓ ${name} | ${totalListings} listings (${allPrices.length} priced), floor $${summary.floor}, avg $${summary.avg}, ceiling $${summary.ceiling}${catLog}`);
 
       // ── Post event-level snapshot ─────────────────────────────────────────
       await postSnapshot({
@@ -413,7 +537,7 @@ async function worker(workerId, queue, results) {
           eventId, eventName: name, eventDate: date, venue,
           platform: 'StubHub',
           totalListings: 0,
-          section:         `Category ${cat.category}`,
+          section:         cat.name,
           sectionListings: 0,
           sectionFloor:    cat.floor,
           sectionAvg:      null,
@@ -423,7 +547,7 @@ async function worker(workerId, queue, results) {
         });
       }
 
-      // ── Update stale event metadata in Supabase ───────────────────────────
+      // ── Update stale metadata in Supabase ─────────────────────────────────
       const canonicalUrl = extractCanonicalUrl(html, eventId);
       const updates = {};
       if (name !== origName)                                  updates.name        = name;
@@ -448,12 +572,11 @@ async function worker(workerId, queue, results) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log(`VKT scraper v4 — concurrency: ${CONCURRENCY}`);
+  console.log(`VKT scraper v5 — concurrency: ${CONCURRENCY}`);
 
   const manualId = process.argv[2];
 
   if (manualId) {
-    // Manual single-event test run
     const queue   = [{ event: { id: manualId, name: 'Manual', date: null, venue: null, stubhub_url: null, is_major: true }, tier: TIERS.FIFA }];
     const results = { scraped: 0, failed: 0 };
     await worker(1, queue, results);
@@ -461,12 +584,9 @@ async function main() {
     return;
   }
 
-  // ── 1. Fetch events from Supabase ─────────────────────────────────────────
   const allEvents = await getEvents();
 
-  // ── 2. Assign tiers ───────────────────────────────────────────────────────
   const tierCounts = { FIFA: 0, DAILY: 0, EVERY_2D: 0, EVERY_3D: 0, SKIPPED: 0 };
-
   const tieredEvents = allEvents
     .filter((e, i, arr) => arr.findIndex(x => x.id === e.id) === i)
     .map(event => {
@@ -485,7 +605,6 @@ async function main() {
 
   console.log(`Tier breakdown — FIFA: ${tierCounts.FIFA} | Daily: ${tierCounts.DAILY} | Every 2d: ${tierCounts.EVERY_2D} | Every 3d: ${tierCounts.EVERY_3D} | Skipped: ${tierCounts.SKIPPED}`);
 
-  // ── 3. Filter recently scraped ────────────────────────────────────────────
   const recentFlags = await Promise.all(
     tieredEvents.map(({ event, tier }) => scrapedRecently(event.id, tier.recentHours))
   );
@@ -505,7 +624,6 @@ async function main() {
 
   if (!queue.length) { console.log('Nothing to scrape.'); return; }
 
-  // ── 4. Run workers concurrently ───────────────────────────────────────────
   const results     = { scraped: 0, failed: 0 };
   const workerCount = Math.min(CONCURRENCY, queue.length);
   console.log(`Launching ${workerCount} workers...`);
