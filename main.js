@@ -1,421 +1,439 @@
-// VKT StubHub Scraper — Full Browser Mode
-// Uses live Playwright browser + network interception for ALL events.
-// Captures every listing API response StubHub fires, giving complete data.
-
-const { chromium } = require('playwright-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const { createClient } = require('@supabase/supabase-js');
-
-chromium.use(StealthPlugin());
+import { Actor } from 'apify';
+import { PlaywrightCrawler } from 'crawlee';
+import { createClient } from '@supabase/supabase-js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVueXBhc2l0Ynp1bGFmZWhicXRqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMTE2MjAsImV4cCI6MjA5MDU4NzYyMH0.ywGB7ZccbVxcgZDXMOQB9Ui8R-SF4xF0SKkWavDbRGI';
-const VKT_API      = process.env.VKT_API      || 'https://vkt-volume-api.vercel.app';
+const VKT_API = process.env.VKT_API || 'https://vkt-volume-api.vercel.app';
 
-const EVENT_LIMIT  = parseInt(process.env.EVENT_LIMIT  || '300', 10);
-const CONCURRENCY  = parseInt(process.env.CONCURRENCY  || '4',   10); // lower — full browser is heavier
-const MIN_PRICE    = 10;
-const MAX_PRICE    = 25000;
+const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
+const FIFA_EVENT_LIMIT = parseInt(process.env.FIFA_EVENT_LIMIT || '80', 10);
+const MIN_PRICE = 10;
+const MAX_PRICE = 25000;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ── TIERS ─────────────────────────────────────────────────────────────────────
-const TIERS = {
-  FIFA:         { label: 'FIFA',     recentHours: 22 },
-  MAJOR_7D:     { label: 'DAILY',    recentHours: 22 },
-  MAJOR_8_30D:  { label: 'EVERY_2D', recentHours: 46 },
-  MAJOR_30PLUS: { label: 'EVERY_3D', recentHours: 70 },
-};
-
-function isFifa(event)    { return !!(event.name && /world cup/i.test(event.name)); }
-function sleep(ms)        { return new Promise(r => setTimeout(r, ms)); }
-function randomDelay(a,b) { return sleep(a + Math.random() * (b - a)); }
-function safeNum(v)       { const n = Number(v); return Number.isFinite(n) ? n : 0; }
-
-function daysUntil(dateStr) {
-  if (!dateStr) return 999;
-  const d = new Date(dateStr + 'T00:00:00'), t = new Date();
-  t.setHours(0,0,0,0);
-  return Math.ceil((d - t) / 86400000);
-}
-
-function getEventTier(event) {
-  if (isFifa(event))   return TIERS.FIFA;
-  if (!event.is_major) return null;
-  const d = daysUntil(event.date);
-  if (d <= 7)          return TIERS.MAJOR_7D;
-  if (d <= 30)         return TIERS.MAJOR_8_30D;
-  return TIERS.MAJOR_30PLUS;
+function safeNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
 }
 
 function normalizeDateString(value) {
   if (!value) return null;
   const s = String(value).trim();
-  const m = s.match(/\b(\d{4}-\d{2}-\d{2})\b/);
-  if (m) return m[1];
+  const isoMatch = s.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  if (isoMatch) return isoMatch[1];
   const d = new Date(s);
-  if (!isNaN(d.getTime())) return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  if (!isNaN(d.getTime())) {
+    return [d.getFullYear(), String(d.getMonth()+1).padStart(2,'0'), String(d.getDate()).padStart(2,'0')].join('-');
+  }
   return null;
 }
 
-function summarizePrices(prices) {
-  const v = (prices||[]).map(safeNum).filter(p => p >= MIN_PRICE && p <= MAX_PRICE).sort((a,b)=>a-b);
-  if (!v.length) return { floor:null, avg:null, ceiling:null };
-  return { floor: Math.round(v[0]), avg: Math.round(v.reduce((a,b)=>a+b,0)/v.length), ceiling: Math.round(v[v.length-1]) };
+function summarizeForAtpCeiling(prices, knownFloor) {
+  const threshold = knownFloor ? knownFloor * 0.9 : MIN_PRICE;
+  const valid = prices.map(safeNum).filter(v => v >= threshold && v <= MAX_PRICE).sort((a,b) => a-b);
+  if (!valid.length) return { avg: null, ceiling: null };
+  return {
+    avg: Math.round(valid.reduce((a,b) => a+b, 0) / valid.length),
+    ceiling: Math.round(valid[valid.length-1]),
+  };
 }
 
 function buildUrl(event) {
-  // Always use the reliable short URL — let StubHub redirect if needed
+  if (event.stubhub_url) return event.stubhub_url.split('?')[0].replace(/\/$/, '') + '/?quantity=0';
+  if (event.name && event.date) {
+    try {
+      const nameSlug = event.name.toLowerCase().replace(/\s+at\s+/i,' ').replace(/[^a-z0-9\s]/g,'').trim().replace(/\s+/g,'-');
+      let citySlug = '';
+      if (event.venue) {
+        const parts = event.venue.split(',');
+        if (parts.length >= 2) citySlug = parts[1].trim().toLowerCase().replace(/[^a-z0-9\s]/g,'').trim().replace(/\s+/g,'-');
+      }
+      const d = new Date(event.date + 'T12:00:00');
+      const dateSlug = `${d.getMonth()+1}-${d.getDate()}-${d.getFullYear()}`;
+      const slug = citySlug ? `${nameSlug}-${citySlug}-tickets-${dateSlug}` : `${nameSlug}-tickets-${dateSlug}`;
+      return `https://www.stubhub.com/${slug}/event/${event.id}/?quantity=0`;
+    } catch (_) {}
+  }
   return `https://www.stubhub.com/event/${event.id}/?quantity=0`;
 }
 
-// ── Recursive JSON price/category walker ──────────────────────────────────────
-
-function walkJson(obj, prices, categoryMap, depth) {
-  if (depth > 12 || !obj || typeof obj !== 'object') return;
-  if (Array.isArray(obj)) { obj.forEach(i => walkJson(i, prices, categoryMap, depth+1)); return; }
-
-  // Total listing count hints
-  // (handled in caller)
-
-  // Individual listing price
-  const raw = obj.currentPrice?.amount ?? obj.currentPrice ??
-              obj.price?.amount ?? obj.price ??
-              obj.listingPrice ?? obj.sellerAllInPrice ??
-              obj.buyerPrice?.amount ?? obj.pricePerTicket;
-  if (raw !== undefined) {
-    const v = parseFloat(String(raw).replace(/[^0-9.]/g, ''));
-    if (Number.isFinite(v) && v >= MIN_PRICE && v <= MAX_PRICE) {
-      prices.push(v);
-      // Track by section
-      const section = String(obj.section || obj.sectionName || obj.category || obj.categoryName || '').trim();
-      if (section) {
-        if (!categoryMap[section]) categoryMap[section] = [];
-        categoryMap[section].push(v);
-      }
-    }
-  }
-
-  // Category-level floor (minPrice objects)
-  const labelVal = obj.categoryName ?? obj.seatCategory ?? obj.ticketClassName ?? obj.zoneName ?? obj.zone ?? obj.label;
-  const floorVal = obj.minPrice ?? obj.floorPrice ?? obj.cheapestPrice ?? obj.startingPrice;
-  if (labelVal && floorVal !== undefined) {
-    const label = String(labelVal).trim();
-    const floor = parseFloat(String(floorVal).replace(/[^0-9.]/g, ''));
-    if (label && Number.isFinite(floor) && floor >= MIN_PRICE && floor <= MAX_PRICE) {
-      if (!categoryMap['__cat__' + label]) {
-        categoryMap['__cat__' + label] = [floor];
-      }
-    }
-  }
-
-  Object.values(obj).forEach(val => walkJson(val, prices, categoryMap, depth+1));
+function extractCanonicalUrl(html, eventId) {
+  const ogMatch = html.match(/<meta[^>]+property="og:url"[^>]+content="([^"]+)"/i) ||
+                  html.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:url"/i);
+  if (ogMatch && ogMatch[1].includes(eventId)) return ogMatch[1].split('?')[0];
+  const canonMatch = html.match(/<link[^>]+rel="canonical"[^>]+href="([^"]+)"/i) ||
+                     html.match(/<link[^>]+href="([^"]+)"[^>]+rel="canonical"/i);
+  if (canonMatch && canonMatch[1].includes(eventId)) return canonMatch[1].split('?')[0];
+  return null;
 }
 
-// ── Scrape one event with a live browser ──────────────────────────────────────
-
-async function scrapeEvent(browser, event) {
-  const url = buildUrl(event);
-  const page = await browser.newPage();
-
-  // Block images and media — keep JS + XHR alive
-  await page.route('**/*', route => {
-    const t = route.request().resourceType();
-    if (['image','media','font'].includes(t)) return route.abort();
-    return route.continue();
-  });
-
-  const prices      = [];
-  const categoryMap = {}; // section name -> [prices]  OR  __cat__Name -> [floor]
-  let totalListings = 0;
-  let name  = null;
-  let date  = null;
-  let venue = null;
-
-  // ── Intercept every JSON response ─────────────────────────────────────────
-  page.on('response', async response => {
-    try {
-      const ct = response.headers()['content-type'] || '';
-      if (!ct.includes('json')) return;
-
-      const respUrl = response.url();
-      const relevant =
-        respUrl.includes('/listings') ||
-        respUrl.includes('/inventory') ||
-        respUrl.includes('/tickets') ||
-        respUrl.includes('/event/') ||
-        respUrl.includes('stubhub.com/api');
-      if (!relevant) return;
-
-      const text = await response.text().catch(() => '');
-      if (!text || text.length < 50) return;
-      let data;
-      try { data = JSON.parse(text); } catch (_) { return; }
-
-      // Extract total count
-      if (data && typeof data === 'object') {
-        const tc = data.totalListings ?? data.numFound ?? data.total ?? data.count;
-        if (tc) totalListings = Math.max(totalListings, tc);
-      }
-
-      walkJson(data, prices, categoryMap, 0);
-    } catch (_) {}
-  });
-
-  let success = false;
-
-  try {
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-    // Check we landed on the right page
-    const finalUrl = page.url();
-    if (!finalUrl.includes(event.id)) {
-      console.log(`  ✗ Redirected away from event ${event.id} → ${finalUrl.slice(0, 80)}`);
-      await page.close();
-      return null;
-    }
-
-    // Wait for listing data to load
-    await page.waitForTimeout(4000);
-
-    // Scroll to trigger lazy loading
-    await page.evaluate(() => { window.scrollTo(0, document.body.scrollHeight / 2); });
-    await page.waitForTimeout(1500);
-    await page.evaluate(() => { window.scrollTo(0, document.body.scrollHeight); });
-    await page.waitForTimeout(1500);
-
-    // Pull metadata from the rendered page
-    const meta = await page.evaluate(() => {
-      let name = null, date = null, venue = null, total = 0;
-      for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
-        try {
-          for (const item of [].concat(JSON.parse(s.textContent))) {
-            if (!item || (item['@type'] !== 'Event' && item['@type'] !== 'SportsEvent')) continue;
-            if (!name  && item.name && !item.name.toLowerCase().includes('tickets')) name = item.name;
-            if (!date  && item.startDate) date = item.startDate;
-            if (!venue && item.location?.name) {
-              const city  = item.location.address?.addressLocality || '';
-              const state = item.location.address?.addressRegion   || '';
-              venue = [item.location.name, city, state].filter(Boolean).join(', ');
-            }
-          }
-        } catch(_) {}
-      }
-      const nums = [...(document.body?.innerText || '').matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
-        .map(m => parseInt(m[1].replace(/,/g,''),10)).filter(v=>v>0);
-      total = nums.length ? Math.max(...nums) : 0;
-      return { name, date, venue, total };
-    });
-
-    if (meta.name)  name  = meta.name;
-    if (meta.date)  date  = meta.date;
-    if (meta.venue) venue = meta.venue;
-    if (meta.total) totalListings = Math.max(totalListings, meta.total);
-
-    success = prices.length > 0;
-
-  } catch (e) {
-    console.log(`  ✗ Browser error: ${e.message.slice(0, 80)}`);
-  }
-
-  await page.close();
-
-  if (!success) return null;
-
-  // Build category list from categoryMap
-  const categories = [];
-  for (const [key, vals] of Object.entries(categoryMap)) {
-    const floor = Math.min(...vals);
-    if (!Number.isFinite(floor) || floor < MIN_PRICE || floor > MAX_PRICE) continue;
-
-    if (key.startsWith('__cat__')) {
-      // Direct category floor object from JSON
-      const catName = key.replace('__cat__', '');
-      if (/categ|zone|hospitality|lower|upper|field|pitch|club/i.test(catName)) {
-        categories.push({ name: catName, floor: Math.round(floor) });
-      }
-    } else {
-      // Section-level data from listing responses
-      if (/categ|cat\s*\d|zone|hospitality|lower|upper|field|pitch|club/i.test(key)) {
-        categories.push({ name: key, floor: Math.round(floor) });
-      }
-    }
-  }
-
-  return { prices, name, date, venue, totalListings, categories };
-}
-
-// ── Post to VKT API ───────────────────────────────────────────────────────────
-
-async function postSnapshot(payload) {
-  try {
-    const r = await fetch(VKT_API + '/api/snapshot', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
-    });
-    if (!r.ok) { console.error('  Snapshot failed:', r.status); return false; }
-    return true;
-  } catch (e) { console.error('  Snapshot error:', e.message); return false; }
-}
-
-// ── Supabase helpers ──────────────────────────────────────────────────────────
-
-async function getEvents() {
+async function getFifaEvents(limit) {
+  const today = new Date().toISOString().slice(0,10);
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() + 12);
+  const end = cutoff.toISOString().slice(0,10);
   const { data, error } = await supabase
     .from('events')
     .select('id,name,date,venue,platform,is_major,stubhub_url')
-    .not('id', 'like', 'tm_%')
-    .not('name', 'ilike', '%football 2026 event%')
-    .not('name', 'ilike', '%basketball 2026 event%')
-    .not('name', 'ilike', '%baseball 2026 event%')
-    .not('name', 'ilike', '%hockey 2026 event%')
-    .not('name', 'ilike', '%soccer 2026 event%')
-    .not('name', 'ilike', '% tickets')
-    .not('name', 'ilike', '%2026 event')
+    .gte('date', today).lte('date', end)
+    .or('name.ilike.%world cup%,name.ilike.%fifa%')
     .order('date', { ascending: true })
-    .limit(EVENT_LIMIT);
-  if (error) { console.error('Failed to fetch events:', error.message); return []; }
+    .limit(limit);
+  if (error) { console.error('FIFA fetch error:', error.message); return []; }
   return data || [];
 }
 
-async function scrapedRecently(eventId, recentHours) {
-  const since = new Date(Date.now() - recentHours * 3600000).toISOString();
+async function scrapedRecently(eventId) {
+  const since = new Date(Date.now() - RECENT_HOURS * 3600000).toISOString();
   const { data } = await supabase.from('volume_snapshots').select('id')
     .eq('event_id', eventId).is('section', null).gte('scraped_at', since).limit(1);
   return !!(data && data.length > 0);
 }
 
-// ── Worker ────────────────────────────────────────────────────────────────────
+async function postSnapshot(payload) {
+  try {
+    const r = await fetch(VKT_API + '/api/snapshot', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    });
+    if (!r.ok) { console.error('Snapshot failed:', r.status, await r.text()); return false; }
+    return true;
+  } catch (e) { console.error('Snapshot error:', e.message); return false; }
+}
 
-async function worker(workerId, browser, queue, results) {
-  while (true) {
-    const item = queue.shift();
-    if (!item) break;
-
-    const { event, tier } = item;
-    const origName = event.name || 'Event ' + event.id;
-
-    console.log(`[W${workerId}][${tier.label}] ${origName} (${event.id})`);
-
+async function dismissModals(page) {
+  await page.evaluate(() => {
+    const modal = document.querySelector('#modal-root');
+    if (modal) modal.innerHTML = '';
+    document.querySelectorAll('[class*="overlay"]').forEach(el => {
+      try { if (window.getComputedStyle(el).position === 'fixed') el.remove(); } catch (_) {}
+    });
+  });
+  for (const sel of ['button:has-text("Accept")','button:has-text("Continue")','button:has-text("Close")','button[aria-label="Close"]','button:has-text("Got it")']) {
     try {
-      const extracted = await scrapeEvent(browser, event);
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 250 })) { await el.click({ timeout: 500 }); await page.waitForTimeout(150); }
+    } catch (_) {}
+  }
+}
 
-      if (!extracted || !extracted.prices.length) {
-        console.log(`[W${workerId}] ✗ No data for ${origName}`);
-        results.failed++;
-        continue;
-      }
+async function waitForCategoryButtons(page, timeout = 8000) {
+  try { await page.waitForSelector('[data-testid="event-detail-zone-chip"]', { timeout }); return true; } catch (_) {}
+  try {
+    await page.waitForFunction(
+      () => Array.from(document.querySelectorAll('button')).some(b => /^Category\s+\d/i.test((b.innerText||'').trim())),
+      { timeout: 3000 }
+    );
+    return true;
+  } catch (_) {}
+  return false;
+}
 
-      let name  = extracted.name || origName;
-      if (name.toLowerCase().includes('tickets')) name = origName;
-      const venue = extracted.venue || event.venue || null;
-      const date  = normalizeDateString(extracted.date) || event.date || null;
-      const { prices, totalListings, categories } = extracted;
+async function extractPricesFromPage(page) {
+  return await page.evaluate(({ minPrice, maxPrice }) => {
+    const prices = new Set();
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      try {
+        if (!node.parentElement) continue;
+        if (node.parentElement.closest('script,style,noscript,svg,header,footer,nav')) continue;
+        const style = window.getComputedStyle(node.parentElement);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+          const value = parseFloat(match[1].replace(/,/g,''));
+          if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.add(value);
+        }
+      } catch (_) { continue; }
+    }
+    return [...prices].sort((a,b) => a-b);
+  }, { minPrice: MIN_PRICE, maxPrice: MAX_PRICE });
+}
 
-      const summary = summarizePrices(prices);
-      if (!summary.floor) {
-        console.log(`[W${workerId}] ✗ No valid prices for ${name}`);
-        results.failed++;
-        continue;
-      }
+async function getListingCount(page) {
+  return await page.evaluate(() => {
+    const bodyText = document.body?.innerText || '';
+    const matches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
+      .map(m => parseInt(m[1].replace(/,/g,''),10)).filter(v => Number.isFinite(v) && v > 0);
+    return matches.length ? Math.max(...matches) : 0;
+  });
+}
 
-      const catLog = categories.length
-        ? ' | cats: ' + categories.slice(0, 4).map(c => `${c.name}=$${c.floor}`).join(', ')
-        : '';
-
-      console.log(`[W${workerId}] ✓ ${name} | ${totalListings} total, ${prices.length} priced, floor $${summary.floor}, avg $${summary.avg}, ceiling $${summary.ceiling}${catLog}`);
-
-      await postSnapshot({
-        eventId: event.id, eventName: name, eventDate: date, venue, platform: 'StubHub',
-        totalListings, section: null, sectionListings: 0,
-        eventFloor: summary.floor, eventAvg: summary.avg, eventCeiling: summary.ceiling,
-        source: 'playwright'
+async function getCategoryButtons(page) {
+  return await page.evaluate(() => {
+    const chipBtns = Array.from(document.querySelectorAll('[data-testid="event-detail-zone-chip"]'));
+    if (chipBtns.length > 0) {
+      return chipBtns.map((b, i) => {
+        const aria = b.getAttribute('aria-label') || '';
+        const priceMatch = aria.match(/\$\s*([\d,]+(?:\.\d{2})?)/);
+        const labelMatch = aria.match(/Category\s+\d+/i);
+        return { label: labelMatch ? labelMatch[0] : `Category ${i+1}`, floor: priceMatch ? parseFloat(priceMatch[1].replace(/,/g,'')) : null, index: i };
       });
+    }
+    return Array.from(document.querySelectorAll('button'))
+      .filter(b => /^Category\s+\d/i.test((b.innerText||'').trim()))
+      .map((b, i) => {
+        const aria = b.getAttribute('aria-label') || '';
+        const priceMatch = aria.match(/\$\s*([\d,]+(?:\.\d{2})?)/);
+        return { label: (b.innerText||'').trim().split('\n')[0].trim(), floor: priceMatch ? parseFloat(priceMatch[1].replace(/,/g,'')) : null, index: i };
+      });
+  });
+}
 
-      for (const cat of categories) {
-        await postSnapshot({
-          eventId: event.id, eventName: name, eventDate: date, venue, platform: 'StubHub',
-          totalListings: 0, section: cat.name, sectionListings: 0,
-          sectionFloor: cat.floor, sectionAvg: null, sectionCeiling: summary.ceiling,
-          eventFloor: null, source: 'playwright'
-        });
+async function interceptNextCategoryUrl(page) {
+  await page.evaluate(() => {
+    window.__capturedCategoryUrl = null;
+    if (!window.__origFetch) window.__origFetch = window.fetch;
+    window.fetch = function (...args) {
+      const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+      if (url.includes('ticketClasses=') && (url.includes('/event/') || url.includes('stubhub')) &&
+          !url.includes('google') && !url.includes('doubleclick') && !url.includes('viagogo')) {
+        window.__capturedCategoryUrl = url.startsWith('http') ? url : 'https://www.stubhub.com' + url;
       }
+      return window.__origFetch.apply(this, args);
+    };
+  });
+}
 
-      const updates = {};
-      if (name !== origName)          updates.name  = name;
-      if (venue && venue !== event.venue) updates.venue = venue;
-      if (date  && date  !== event.date)  updates.date  = date;
-      if (Object.keys(updates).length) await supabase.from('events').update(updates).eq('id', event.id);
+async function getCapturedUrl(page) {
+  return await page.evaluate(() => window.__capturedCategoryUrl);
+}
 
-      results.scraped++;
+await Actor.init();
 
-    } catch (e) {
-      console.error(`[W${workerId}] Error on ${event.id}:`, e.message);
-      results.failed++;
+const input = await Actor.getInput() || {};
+const manualEventId = input.eventId || null;
+
+let events;
+if (manualEventId) {
+  const { data } = await supabase.from('events').select('id,name,date,venue,platform,is_major,stubhub_url').eq('id', manualEventId).limit(1);
+  events = data && data.length > 0 ? data : [{ id: manualEventId, name: 'Manual FIFA Event', date: null, venue: null, platform: 'StubHub', is_major: true, stubhub_url: null }];
+} else {
+  events = await getFifaEvents(FIFA_EVENT_LIMIT);
+  console.log(`FIFA events fetched: ${events.length}`);
+}
+
+const requests = [];
+for (const event of events) {
+  if (!manualEventId && await scrapedRecently(event.id)) {
+    console.log(`Skipping recent: ${event.name} (${event.id})`);
+    continue;
+  }
+  requests.push({ url: buildUrl(event), userData: { event } });
+}
+
+console.log(`FIFA URLs to scrape: ${requests.length}`);
+
+const crawler = new PlaywrightCrawler({
+  proxyConfiguration: await Actor.createProxyConfiguration({
+    groups: ['RESIDENTIAL'],
+    countryCode: 'US',
+  }),
+  launchContext: {
+    launchOptions: {
+      headless: true,
+      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-blink-features=AutomationControlled'],
+    },
+  },
+  maxConcurrency: 1,
+  maxRequestRetries: 1,
+  requestHandlerTimeoutSecs: 180,
+  navigationTimeoutSecs: 45,
+  browserPoolOptions: { useFingerprints: true },
+  preNavigationHooks: [
+    async ({ page }) => {
+      await page.route('**/*', async route => {
+        try {
+          const req = route.request();
+          const type = req.resourceType();
+          const url = req.url();
+          if (type === 'image' || type === 'media' || type === 'font' || type === 'stylesheet' ||
+              url.includes('google-analytics') || url.includes('googletagmanager') ||
+              url.includes('doubleclick') || url.includes('facebook') ||
+              url.includes('hotjar') || url.includes('intercom') || url.includes('segment')) {
+            await route.abort(); return;
+          }
+          await route.continue();
+        } catch (_) { try { await route.continue(); } catch (_) {} }
+      });
+      await page.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => false }); });
+    },
+  ],
+
+  async requestHandler({ page, request }) {
+    const { event } = request.userData;
+    const eventId = event.id;
+    const originalName = event.name || `Event ${eventId}`;
+    console.log(`\nScraping: ${originalName} (${eventId})`);
+
+    const title = await page.title().catch(() => '');
+    if (title) console.log(`  Title: ${title.slice(0,100)}`);
+
+    if (/Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(title)) {
+      const shortUrl = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
+      if (request.url !== shortUrl) {
+        console.log('  Wrong page, retrying...');
+        await page.goto(shortUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.waitForTimeout(1500);
+        const newTitle = await page.title().catch(() => '');
+        if (/Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(newTitle)) { console.log('  Still wrong, skipping'); return; }
+      } else { return; }
     }
 
-    await randomDelay(1000, 2500);
-  }
-}
+    await dismissModals(page);
+    console.log('  Waiting for listings/prices...');
+    try {
+      await page.waitForFunction(
+        () => /\$\s*\d+/.test(document.body?.innerText||'') && /listings?/i.test(document.body?.innerText||''),
+        { timeout: 15000 }
+      );
+    } catch (_) { await page.waitForTimeout(1500); }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+    await page.waitForTimeout(1200);
+    await dismissModals(page);
+    await waitForCategoryButtons(page, 8000);
 
-async function main() {
-  console.log(`VKT scraper — full browser mode, concurrency: ${CONCURRENCY}`);
+    const html = await page.content();
+    const canonicalUrl = extractCanonicalUrl(html, eventId);
 
-  const manualId = process.argv[2];
+    const meta = await page.evaluate(() => {
+      let name = null, date = null, venue = null;
+      for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+        try {
+          const items = [].concat(JSON.parse(script.textContent));
+          for (const item of items) {
+            if (!item || typeof item !== 'object') continue;
+            if (item['@type'] !== 'Event' && item['@type'] !== 'SportsEvent') continue;
+            if (!name && item.name && !item.name.toLowerCase().includes('tickets')) name = item.name;
+            if (!date && item.startDate) date = item.startDate;
+            if (!venue && item.location?.name) {
+              const city = item.location.address?.addressLocality || '';
+              const state = item.location.address?.addressRegion || '';
+              venue = [item.location.name, city, state].filter(Boolean).join(', ');
+            }
+            if (name && date && venue) break;
+          }
+        } catch (_) {}
+        if (name && date && venue) break;
+      }
+      return { name, date, venue };
+    });
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
-           '--no-first-run','--no-zygote','--disable-gpu']
-  });
+    let name = meta.name || originalName;
+    if (name && name.toLowerCase().includes('tickets')) name = originalName;
+    const venue = meta.venue || event.venue || null;
+    const date = normalizeDateString(meta.date) || event.date || null;
+    const totalListings = await getListingCount(page);
+    const categoryButtons = await getCategoryButtons(page);
 
-  if (manualId) {
-    const queue = [{ event: { id: manualId, name: 'Manual', date: null, venue: null, is_major: true }, tier: TIERS.FIFA }];
-    const results = { scraped: 0, failed: 0 };
-    await worker(1, browser, queue, results);
-    await browser.close();
-    console.log(`Done — scraped: ${results.scraped}, failed: ${results.failed}`);
-    return;
-  }
+    console.log(`  Categories: ${categoryButtons.length}, listings: ${totalListings}`);
+    if (categoryButtons.length > 0) console.log(`  Floors: ${categoryButtons.map(c=>`${c.label}=$${c.floor}`).join(', ')}`);
 
-  const allEvents = await getEvents();
-  const tierCounts = { FIFA: 0, DAILY: 0, EVERY_2D: 0, EVERY_3D: 0, SKIPPED: 0 };
+    const categoryData = [];
+    const baseUrl = request.url.split('?')[0];
 
-  const tieredEvents = allEvents
-    .filter((e, i, arr) => arr.findIndex(x => x.id === e.id) === i)
-    .map(event => {
-      const tier = getEventTier(event);
-      if (!tier) { tierCounts.SKIPPED++; return null; }
-      return { event, tier };
-    }).filter(Boolean);
+    if (categoryButtons.length > 0) {
+      for (const cat of categoryButtons) {
+        try {
+          await interceptNextCategoryUrl(page);
+          await page.evaluate((idx) => {
+            const chips = document.querySelectorAll('[data-testid="event-detail-zone-chip"]');
+            if (chips[idx]) { chips[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return; }
+            const btns = Array.from(document.querySelectorAll('button')).filter(b => /^Category\s+\d/i.test((b.innerText||'').trim()));
+            if (btns[idx]) btns[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          }, cat.index);
 
-  tieredEvents.forEach(({ tier }) => {
-    if      (tier.label === 'FIFA')     tierCounts.FIFA++;
-    else if (tier.label === 'DAILY')    tierCounts.DAILY++;
-    else if (tier.label === 'EVERY_2D') tierCounts.EVERY_2D++;
-    else if (tier.label === 'EVERY_3D') tierCounts.EVERY_3D++;
-  });
+          await page.waitForTimeout(1200);
+          const categoryUrl = await getCapturedUrl(page);
 
-  console.log(`Tier breakdown — FIFA: ${tierCounts.FIFA} | Daily: ${tierCounts.DAILY} | Every 2d: ${tierCounts.EVERY_2D} | Every 3d: ${tierCounts.EVERY_3D} | Skipped: ${tierCounts.SKIPPED}`);
+          if (categoryUrl) {
+            console.log(`  ${cat.label}: loading category URL`);
+            await page.goto(categoryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.waitForTimeout(1500);
+            await dismissModals(page);
+            const catPrices = await extractPricesFromPage(page);
+            const catListings = await getListingCount(page);
+            const floor = cat.floor;
+            const { avg, ceiling } = summarizeForAtpCeiling(catPrices, floor);
+            console.log(`  ${cat.label}: listings=${catListings}, floor=$${floor}, atp=$${avg}, ceiling=$${ceiling}`);
+            categoryData.push({ label: cat.label, listings: catListings, floor, avg, ceiling });
+            await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.waitForTimeout(1200);
+            await dismissModals(page);
+            await waitForCategoryButtons(page, 5000);
+          } else {
+            console.log(`  ${cat.label}: no URL captured, floor only`);
+            categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
+          }
+        } catch (e) {
+          console.log(`  ${cat.label} error: ${e.message.slice(0,80)}`);
+          categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
+          try {
+            await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.waitForTimeout(1000);
+            await dismissModals(page);
+          } catch (_) {}
+        }
+      }
+    }
 
-  const recentFlags = await Promise.all(
-    tieredEvents.map(({ event, tier }) => scrapedRecently(event.id, tier.recentHours))
-  );
+    let eventSummary;
+    if (categoryData.length > 0) {
+      const floors = categoryData.map(c => c.floor).filter(Boolean);
+      const ceilings = categoryData.map(c => c.ceiling).filter(Boolean);
+      const atps = categoryData.map(c => c.avg).filter(Boolean);
+      eventSummary = {
+        floor: floors.length ? Math.min(...floors) : null,
+        avg: atps.length ? Math.round(atps.reduce((a,b)=>a+b,0)/atps.length) : null,
+        ceiling: ceilings.length ? Math.max(...ceilings) : null,
+      };
+    } else {
+      const prices = await extractPricesFromPage(page);
+      const valid = prices.filter(p => p >= MIN_PRICE && p <= MAX_PRICE).sort((a,b)=>a-b);
+      eventSummary = valid.length
+        ? { floor: Math.round(valid[0]), avg: Math.round(valid.reduce((a,b)=>a+b,0)/valid.length), ceiling: Math.round(valid[valid.length-1]) }
+        : { floor: null, avg: null, ceiling: null };
+    }
 
-  const queue = tieredEvents.filter((_, i) => !recentFlags[i]);
-  console.log(`Skipping ${tieredEvents.length - queue.length} recently scraped — ${queue.length} events to process`);
+    if (!eventSummary.floor) { console.log(`  No pricing for ${name}`); return; }
 
-  if (!queue.length) { await browser.close(); console.log('Nothing to scrape.'); return; }
+    console.log(`  ${name} | floor=$${eventSummary.floor}, atp=$${eventSummary.avg}, ceiling=$${eventSummary.ceiling}`);
 
-  const results = { scraped: 0, failed: 0 };
-  const workerCount = Math.min(CONCURRENCY, queue.length);
-  console.log(`Launching ${workerCount} workers...`);
+    await postSnapshot({
+      eventId, eventName: name, eventDate: date, venue, platform: 'StubHub',
+      totalListings, section: null, sectionListings: 0,
+      eventFloor: eventSummary.floor, eventAvg: eventSummary.avg, eventCeiling: eventSummary.ceiling,
+      source: 'apify',
+    });
 
-  await Promise.all(Array.from({ length: workerCount }, (_, i) => worker(i + 1, browser, queue, results)));
+    for (const cat of categoryData) {
+      if (!cat.floor) continue;
+      await postSnapshot({
+        eventId, eventName: name, eventDate: date, venue, platform: 'StubHub',
+        totalListings: 0, section: cat.label, sectionListings: cat.listings,
+        sectionFloor: cat.floor, sectionAvg: cat.avg, sectionCeiling: cat.ceiling,
+        eventFloor: eventSummary.floor, eventAvg: eventSummary.avg, eventCeiling: eventSummary.ceiling,
+        source: 'apify',
+      });
+      console.log(`  Saved ${cat.label}: floor=$${cat.floor}, atp=$${cat.avg}, ceiling=$${cat.ceiling}`);
+    }
 
-  await browser.close();
-  console.log(`\nDone — scraped: ${results.scraped}, failed: ${results.failed}`);
-}
+    const updates = {};
+    if (name !== originalName) updates.name = name;
+    if (venue && venue !== event.venue) updates.venue = venue;
+    if (date && date !== event.date) updates.date = date;
+    if (canonicalUrl && canonicalUrl !== event.stubhub_url) updates.stubhub_url = canonicalUrl;
+    if (Object.keys(updates).length) await supabase.from('events').update(updates).eq('id', eventId);
+  },
 
-main().catch(e => { console.error(e); process.exit(1); });
+  failedRequestHandler({ request, error }) {
+    console.error(`Failed: ${request.url} — ${error.message}`);
+  },
+});
+
+await crawler.addRequests(requests);
+await crawler.run();
+
+console.log('\nDone.');
+await Actor.exit();
