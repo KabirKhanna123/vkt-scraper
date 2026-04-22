@@ -35,7 +35,7 @@ function summarizeForAtpCeiling(prices, knownFloor) {
   const valid = prices.map(safeNum).filter(v => v >= threshold && v <= MAX_PRICE).sort((a,b) => a-b);
   if (!valid.length) return { avg: null, ceiling: null };
   return {
-    avg: Math.round(valid.reduce((a,b) => a+b, 0) / valid.length),
+    avg: Math.round(valid.reduce((a,b) => a+b,0) / valid.length),
     ceiling: Math.round(valid[valid.length-1]),
   };
 }
@@ -110,12 +110,50 @@ async function dismissModals(page) {
       try { if (window.getComputedStyle(el).position === 'fixed') el.remove(); } catch (_) {}
     });
   });
-  for (const sel of ['button:has-text("Accept")','button:has-text("Continue")','button:has-text("Close")','button[aria-label="Close"]','button:has-text("Got it")']) {
+  for (const sel of [
+    'button:has-text("Accept")',
+    'button:has-text("Continue")',
+    'button:has-text("Close")',
+    'button[aria-label="Close"]',
+    'button:has-text("Got it")',
+  ]) {
     try {
       const el = page.locator(sel).first();
       if (await el.isVisible({ timeout: 250 })) { await el.click({ timeout: 500 }); await page.waitForTimeout(150); }
     } catch (_) {}
   }
+}
+
+// Switches StubHub from "Recommended" filtered view to "All Tickets" so all
+// listings are visible and category URL interception captures full data.
+async function dismissRecommended(page) {
+  try {
+    const allTickets = page.locator([
+      'button:has-text("All Tickets")',
+      'button:has-text("All listings")',
+      '[data-testid="all-listings-tab"]',
+      '[data-testid="listings-tab-all"]',
+    ].join(', ')).first();
+    if (await allTickets.isVisible({ timeout: 2000 })) {
+      await allTickets.click({ timeout: 1000 });
+      await page.waitForTimeout(800);
+      console.log('  Switched to All Tickets view');
+      return;
+    }
+  } catch (_) {}
+
+  try {
+    const recommended = page.locator([
+      '[aria-pressed="true"]:has-text("Recommended")',
+      'button.active:has-text("Recommended")',
+      '[data-testid="recommended-filter"]:has-text("Recommended")',
+    ].join(', ')).first();
+    if (await recommended.isVisible({ timeout: 1000 })) {
+      await recommended.click({ timeout: 1000 });
+      await page.waitForTimeout(800);
+      console.log('  Dismissed Recommended filter');
+    }
+  } catch (_) {}
 }
 
 async function waitForCategoryButtons(page, timeout = 8000) {
@@ -168,7 +206,11 @@ async function getCategoryButtons(page) {
         const aria = b.getAttribute('aria-label') || '';
         const priceMatch = aria.match(/\$\s*([\d,]+(?:\.\d{2})?)/);
         const labelMatch = aria.match(/Category\s+\d+/i);
-        return { label: labelMatch ? labelMatch[0] : `Category ${i+1}`, floor: priceMatch ? parseFloat(priceMatch[1].replace(/,/g,'')) : null, index: i };
+        return {
+          label: labelMatch ? labelMatch[0] : `Category ${i+1}`,
+          floor: priceMatch ? parseFloat(priceMatch[1].replace(/,/g,'')) : null,
+          index: i,
+        };
       });
     }
     return Array.from(document.querySelectorAll('button'))
@@ -176,7 +218,11 @@ async function getCategoryButtons(page) {
       .map((b, i) => {
         const aria = b.getAttribute('aria-label') || '';
         const priceMatch = aria.match(/\$\s*([\d,]+(?:\.\d{2})?)/);
-        return { label: (b.innerText||'').trim().split('\n')[0].trim(), floor: priceMatch ? parseFloat(priceMatch[1].replace(/,/g,'')) : null, index: i };
+        return {
+          label: (b.innerText||'').trim().split('\n')[0].trim(),
+          floor: priceMatch ? parseFloat(priceMatch[1].replace(/,/g,'')) : null,
+          index: i,
+        };
       });
   });
 }
@@ -187,8 +233,11 @@ async function interceptNextCategoryUrl(page) {
     if (!window.__origFetch) window.__origFetch = window.fetch;
     window.fetch = function (...args) {
       const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
-      if (url.includes('ticketClasses=') && (url.includes('/event/') || url.includes('stubhub')) &&
-          !url.includes('google') && !url.includes('doubleclick') && !url.includes('viagogo')) {
+      if (
+        url.includes('ticketClasses=') &&
+        (url.includes('/event/') || url.includes('stubhub')) &&
+        !url.includes('google') && !url.includes('doubleclick') && !url.includes('viagogo')
+      ) {
         window.__capturedCategoryUrl = url.startsWith('http') ? url : 'https://www.stubhub.com' + url;
       }
       return window.__origFetch.apply(this, args);
@@ -208,7 +257,10 @@ const manualEventId = input.eventId || null;
 let events;
 if (manualEventId) {
   const { data } = await supabase.from('events').select('id,name,date,venue,platform,is_major,stubhub_url').eq('id', manualEventId).limit(1);
-  events = data && data.length > 0 ? data : [{ id: manualEventId, name: 'Manual FIFA Event', date: null, venue: null, platform: 'StubHub', is_major: true, stubhub_url: null }];
+  events = data && data.length > 0 ? data : [{
+    id: manualEventId, name: 'Manual FIFA Event', date: null,
+    venue: null, platform: 'StubHub', is_major: true, stubhub_url: null,
+  }];
 } else {
   events = await getFifaEvents(FIFA_EVENT_LIMIT);
   console.log(`FIFA events fetched: ${events.length}`);
@@ -241,6 +293,7 @@ const crawler = new PlaywrightCrawler({
   requestHandlerTimeoutSecs: 180,
   navigationTimeoutSecs: 45,
   browserPoolOptions: { useFingerprints: true },
+
   preNavigationHooks: [
     async ({ page }) => {
       await page.route('**/*', async route => {
@@ -248,16 +301,20 @@ const crawler = new PlaywrightCrawler({
           const req = route.request();
           const type = req.resourceType();
           const url = req.url();
-          if (type === 'image' || type === 'media' || type === 'font' || type === 'stylesheet' ||
-              url.includes('google-analytics') || url.includes('googletagmanager') ||
-              url.includes('doubleclick') || url.includes('facebook') ||
-              url.includes('hotjar') || url.includes('intercom') || url.includes('segment')) {
+          if (
+            type === 'image' || type === 'media' || type === 'font' || type === 'stylesheet' ||
+            url.includes('google-analytics') || url.includes('googletagmanager') ||
+            url.includes('doubleclick') || url.includes('facebook') ||
+            url.includes('hotjar') || url.includes('intercom') || url.includes('segment')
+          ) {
             await route.abort(); return;
           }
           await route.continue();
         } catch (_) { try { await route.continue(); } catch (_) {} }
       });
-      await page.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => false }); });
+      await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      });
     },
   ],
 
@@ -277,11 +334,14 @@ const crawler = new PlaywrightCrawler({
         await page.goto(shortUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
         await page.waitForTimeout(1500);
         const newTitle = await page.title().catch(() => '');
-        if (/Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(newTitle)) { console.log('  Still wrong, skipping'); return; }
+        if (/Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(newTitle)) {
+          console.log('  Still wrong, skipping'); return;
+        }
       } else { return; }
     }
 
     await dismissModals(page);
+
     console.log('  Waiting for listings/prices...');
     try {
       await page.waitForFunction(
@@ -292,6 +352,7 @@ const crawler = new PlaywrightCrawler({
 
     await page.waitForTimeout(1200);
     await dismissModals(page);
+    await dismissRecommended(page);          // ← switch to all tickets
     await waitForCategoryButtons(page, 8000);
 
     const html = await page.content();
@@ -328,7 +389,9 @@ const crawler = new PlaywrightCrawler({
     const categoryButtons = await getCategoryButtons(page);
 
     console.log(`  Categories: ${categoryButtons.length}, listings: ${totalListings}`);
-    if (categoryButtons.length > 0) console.log(`  Floors: ${categoryButtons.map(c=>`${c.label}=$${c.floor}`).join(', ')}`);
+    if (categoryButtons.length > 0) {
+      console.log(`  Floors: ${categoryButtons.map(c=>`${c.label}=$${c.floor}`).join(', ')}`);
+    }
 
     const categoryData = [];
     const baseUrl = request.url.split('?')[0];
@@ -337,10 +400,14 @@ const crawler = new PlaywrightCrawler({
       for (const cat of categoryButtons) {
         try {
           await interceptNextCategoryUrl(page);
+
           await page.evaluate((idx) => {
             const chips = document.querySelectorAll('[data-testid="event-detail-zone-chip"]');
-            if (chips[idx]) { chips[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return; }
-            const btns = Array.from(document.querySelectorAll('button')).filter(b => /^Category\s+\d/i.test((b.innerText||'').trim()));
+            if (chips[idx]) {
+              chips[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return;
+            }
+            const btns = Array.from(document.querySelectorAll('button'))
+              .filter(b => /^Category\s+\d/i.test((b.innerText||'').trim()));
             if (btns[idx]) btns[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
           }, cat.index);
 
@@ -358,9 +425,11 @@ const crawler = new PlaywrightCrawler({
             const { avg, ceiling } = summarizeForAtpCeiling(catPrices, floor);
             console.log(`  ${cat.label}: listings=${catListings}, floor=$${floor}, atp=$${avg}, ceiling=$${ceiling}`);
             categoryData.push({ label: cat.label, listings: catListings, floor, avg, ceiling });
+
             await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
             await page.waitForTimeout(1200);
             await dismissModals(page);
+            await dismissRecommended(page);  // ← keep all-tickets on return nav
             await waitForCategoryButtons(page, 5000);
           } else {
             console.log(`  ${cat.label}: no URL captured, floor only`);
@@ -373,6 +442,8 @@ const crawler = new PlaywrightCrawler({
             await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
             await page.waitForTimeout(1000);
             await dismissModals(page);
+            await dismissRecommended(page);  // ← and on error recovery
+            await waitForCategoryButtons(page, 5000);
           } catch (_) {}
         }
       }
