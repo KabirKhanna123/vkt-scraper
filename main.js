@@ -252,15 +252,27 @@ async function getCapturedUrl(page) {
 await Actor.init();
 
 const input = await Actor.getInput() || {};
-const manualEventId = input.eventId || null;
+
+// Accept single eventId, comma-separated eventIds, or array of eventIds
+const rawIds = input.eventIds || input.eventId || null;
+const manualIds = rawIds
+  ? (Array.isArray(rawIds) ? rawIds : String(rawIds).split(',').map(s => s.trim()).filter(Boolean))
+  : null;
 
 let events;
-if (manualEventId) {
-  const { data } = await supabase.from('events').select('id,name,date,venue,platform,is_major,stubhub_url').eq('id', manualEventId).limit(1);
-  events = data && data.length > 0 ? data : [{
-    id: manualEventId, name: 'Manual FIFA Event', date: null,
-    venue: null, platform: 'StubHub', is_major: true, stubhub_url: null,
-  }];
+if (manualIds && manualIds.length > 0) {
+  console.log(`Manual event IDs: ${manualIds.join(', ')}`);
+  const { data } = await supabase.from('events')
+    .select('id,name,date,venue,platform,is_major,stubhub_url')
+    .in('id', manualIds);
+  const found = data || [];
+  // For any IDs not in DB, create placeholder entries
+  events = manualIds.map(id => {
+    return found.find(e => e.id === id) || {
+      id, name: 'Manual FIFA Event', date: null,
+      venue: null, platform: 'StubHub', is_major: true, stubhub_url: null,
+    };
+  });
 } else {
   events = await getFifaEvents(FIFA_EVENT_LIMIT);
   console.log(`FIFA events fetched: ${events.length}`);
@@ -268,7 +280,7 @@ if (manualEventId) {
 
 const requests = [];
 for (const event of events) {
-  if (!manualEventId && await scrapedRecently(event.id)) {
+  if (!manualIds && await scrapedRecently(event.id)) {
     console.log(`Skipping recent: ${event.name} (${event.id})`);
     continue;
   }
