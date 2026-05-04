@@ -246,23 +246,7 @@ async function dismissRecommended(page) {
         await viewBtn.click({ timeout: 2500 });
         console.log(`  Applied: ${btnText.trim()}`);
 
-        await page.waitForTimeout(2500);
-
-        try {
-          await page.waitForFunction((oldCount) => {
-            const bodyText = document.body?.innerText || '';
-            const counts = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
-              .map(m => parseInt(m[1].replace(/,/g,''),10))
-              .filter(v => Number.isFinite(v) && v > 0);
-            if (!counts.length) return false;
-            const newMax = Math.max(...counts);
-            return oldCount === null || newMax !== oldCount;
-          }, beforeMax, { timeout: 8000 });
-        } catch (_) {
-          console.log('  Listing count did not visibly change after applying filters');
-        }
-
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(3000);
       }
     } catch (_) {}
 
@@ -437,7 +421,7 @@ const crawler = new PlaywrightCrawler({
   },
   maxConcurrency: 1,
   maxRequestRetries: 1,
-  requestHandlerTimeoutSecs: 180,
+  requestHandlerTimeoutSecs: 300,
   navigationTimeoutSecs: 45,
   browserPoolOptions: { useFingerprints: true },
 
@@ -583,8 +567,6 @@ const crawler = new PlaywrightCrawler({
             await page.goto(categoryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
             await page.waitForTimeout(1500);
             await dismissModals(page);
-            await dismissRecommended(page);
-            await page.waitForTimeout(600);
             const catPrices = await extractPricesFromPage(page);
             const catListings = await getListingCount(page);
             const floor = cat.floor;
@@ -593,15 +575,8 @@ const crawler = new PlaywrightCrawler({
             categoryData.push({ label: cat.label, listings: catListings, floor, avg, ceiling });
 
             await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForTimeout(2000);
+            await page.waitForTimeout(1500);
             await dismissModals(page);
-            try {
-              await page.waitForFunction(
-                () => Array.from(document.querySelectorAll('button')).some(b => (b.innerText||'').trim().toLowerCase() === 'filters'),
-                { timeout: 6000 }
-              );
-            } catch (_) {}
-            await dismissRecommended(page);
             await waitForCategoryButtons(page, 5000);
           } else {
             console.log(`  ${cat.label}: no URL captured, floor only`);
@@ -612,15 +587,8 @@ const crawler = new PlaywrightCrawler({
           categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
           try {
             await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForTimeout(2000);
+            await page.waitForTimeout(1500);
             await dismissModals(page);
-            try {
-              await page.waitForFunction(
-                () => Array.from(document.querySelectorAll('button')).some(b => (b.innerText||'').trim().toLowerCase() === 'filters'),
-                { timeout: 6000 }
-              );
-            } catch (_) {}
-            await dismissRecommended(page);
             await waitForCategoryButtons(page, 5000);
           } catch (_) {}
         }
