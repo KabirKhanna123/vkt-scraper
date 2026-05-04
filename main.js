@@ -156,14 +156,13 @@ async function dismissRecommended(page) {
           const aria = (b.getAttribute('aria-label') || '').toLowerCase();
           const testid = (b.getAttribute('data-testid') || '').toLowerCase();
           const isRealFiltersButton =
+            testid === 'event-detail-filters-button' ||
+            testid === 'filter-button' ||
+            testid === 'filters-button' ||
             text === 'filters' ||
             text === 'filter' ||
             aria === 'filters' ||
-            aria === 'filter' ||
-            testid === 'filter-button' ||
-            testid === 'filters-button' ||
-            testid.includes('filter-button') ||
-            testid.includes('filters-button');
+            aria === 'filter';
 
           if (isRealFiltersButton) {
             b.click();
