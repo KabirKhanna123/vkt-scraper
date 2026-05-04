@@ -222,12 +222,35 @@ async function dismissRecommended(page) {
     }
 
     try {
+      const beforeText = await page.evaluate(() => document.body?.innerText || '');
+      const beforeCounts = [...beforeText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
+        .map(m => parseInt(m[1].replace(/,/g,''),10))
+        .filter(v => Number.isFinite(v) && v > 0);
+      const beforeMax = beforeCounts.length ? Math.max(...beforeCounts) : null;
+
       const viewBtn = page.locator('button:has-text("View")').first();
       if (await viewBtn.isVisible({ timeout: 2500 })) {
         const btnText = await viewBtn.innerText();
         await viewBtn.click({ timeout: 2500 });
-        await page.waitForTimeout(1200);
         console.log(`  Applied: ${btnText.trim()}`);
+
+        await page.waitForTimeout(2500);
+
+        try {
+          await page.waitForFunction((oldCount) => {
+            const bodyText = document.body?.innerText || '';
+            const counts = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
+              .map(m => parseInt(m[1].replace(/,/g,''),10))
+              .filter(v => Number.isFinite(v) && v > 0);
+            if (!counts.length) return false;
+            const newMax = Math.max(...counts);
+            return oldCount === null || newMax !== oldCount;
+          }, beforeMax, { timeout: 8000 });
+        } catch (_) {
+          console.log('  Listing count did not visibly change after applying filters');
+        }
+
+        await page.waitForTimeout(2000);
       }
     } catch (_) {}
 
@@ -467,7 +490,7 @@ const crawler = new PlaywrightCrawler({
     console.log('  Turning off recommended tickets...');
     await dismissRecommended(page);
 
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(5000);
     await waitForCategoryButtons(page, 8000);
 
     const html = await page.content();
