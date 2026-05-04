@@ -124,77 +124,102 @@ async function dismissModals(page) {
   }
 }
 
-// Switches StubHub from "Recommended" filtered view to "All Tickets" so all
-// listings are visible and category URL interception captures full data.
 async function dismissRecommended(page) {
-  // Log all visible buttons so we can see what StubHub actually renders
   try {
-    const buttonInfo = await page.evaluate(() => {
-      return Array.from(document.querySelectorAll('button'))
-        .filter(b => {
-          const t = (b.innerText || '').trim().toLowerCase();
-          return t.includes('recommend') || t.includes('all ticket') || t.includes('all listing') || t.includes('sort') || t.includes('filter');
-        })
-        .map(b => ({
-          text: (b.innerText || '').trim().slice(0, 60),
+    // Dump ALL buttons and interactive elements for debugging
+    const allButtons = await page.evaluate(() => {
+      const results = [];
+      document.querySelectorAll('button').forEach(b => {
+        const text = (b.innerText || b.textContent || '').trim().slice(0, 80);
+        if (!text) return;
+        results.push({
+          type: 'button',
+          text,
           testid: b.getAttribute('data-testid') || '',
           ariaPressed: b.getAttribute('aria-pressed') || '',
-          className: b.className.slice(0, 80),
-        }));
+          ariaSelected: b.getAttribute('aria-selected') || '',
+          ariaCurrent: b.getAttribute('aria-current') || '',
+          ariaLabel: b.getAttribute('aria-label') || '',
+          className: b.className.slice(0, 100),
+        });
+      });
+      document.querySelectorAll('[role="tab"], [role="option"], [role="radio"]').forEach(el => {
+        const text = (el.innerText || el.textContent || '').trim().slice(0, 80);
+        if (!text) return;
+        results.push({
+          type: el.getAttribute('role'),
+          text,
+          testid: el.getAttribute('data-testid') || '',
+          ariaPressed: el.getAttribute('aria-pressed') || '',
+          ariaSelected: el.getAttribute('aria-selected') || '',
+          ariaCurrent: el.getAttribute('aria-current') || '',
+          ariaLabel: el.getAttribute('aria-label') || '',
+          className: el.className.slice(0, 100),
+        });
+      });
+      return results;
     });
-    if (buttonInfo.length) console.log('  Filter buttons found:', JSON.stringify(buttonInfo));
-  } catch (_) {}
 
-  // Try every possible selector for "All Tickets" / deselect Recommended
-  const selectors = [
+    console.log('\n  === ALL PAGE BUTTONS ===');
+    allButtons.forEach(b => {
+      console.log(`  [${b.type}] "${b.text}" | testid="${b.testid}" | pressed="${b.ariaPressed}" | selected="${b.ariaSelected}" | current="${b.ariaCurrent}" | label="${b.ariaLabel}"`);
+    });
+    console.log('  === END BUTTONS ===\n');
+  } catch (e) {
+    console.log('  Debug error:', e.message);
+  }
+
+  // Strategy 1: playwright locators for All Tickets variants
+  const allSelectors = [
     'button:has-text("All Tickets")',
     'button:has-text("All listings")',
-    'button:has-text("All")',
     '[data-testid="all-listings-tab"]',
     '[data-testid="listings-tab-all"]',
     '[data-testid="sort-filter-all"]',
+    '[aria-label="All Tickets"]',
+    '[aria-label="All listings"]',
   ];
-
-  for (const sel of selectors) {
+  for (const sel of allSelectors) {
     try {
       const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 600 })) {
-        await el.click({ timeout: 800 });
-        await page.waitForTimeout(600);
+      if (await el.isVisible({ timeout: 400 })) {
+        await el.click({ timeout: 600 });
+        await page.waitForTimeout(800);
         console.log(`  Clicked: ${sel}`);
         return;
       }
     } catch (_) {}
   }
 
-  // Try clicking any active/pressed "Recommended" button to deselect it
-  try {
-    const clicked = await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button'));
-      for (const b of btns) {
-        const t = (b.innerText || '').trim().toLowerCase();
-        const pressed = b.getAttribute('aria-pressed');
-        const selected = b.getAttribute('aria-selected');
-        if (t.includes('recommend') && (pressed === 'true' || selected === 'true')) {
-          b.click();
-          return `clicked recommended: ${b.innerText.trim()}`;
-        }
+  // Strategy 2: find and deselect active Recommended, or click any All button
+  const clicked = await page.evaluate(() => {
+    const btns = Array.from(document.querySelectorAll('button, [role="tab"], [role="option"], [role="radio"]'));
+    for (const b of btns) {
+      const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+      const pressed = b.getAttribute('aria-pressed');
+      const selected = b.getAttribute('aria-selected');
+      const current = b.getAttribute('aria-current');
+      if (t.includes('recommend') && (pressed === 'true' || selected === 'true' || current === 'true')) {
+        b.click();
+        return `deselected recommended: "${(b.innerText||'').trim()}"`;
       }
-      // Also try clicking any "All" button near listings area
-      for (const b of btns) {
-        const t = (b.innerText || '').trim().toLowerCase();
-        if (t === 'all' || t === 'all tickets' || t === 'all listings') {
-          b.click();
-          return `clicked all: ${b.innerText.trim()}`;
-        }
-      }
-      return null;
-    });
-    if (clicked) {
-      console.log(`  ${clicked}`);
-      await page.waitForTimeout(600);
     }
-  } catch (_) {}
+    for (const b of btns) {
+      const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+      if (t === 'all' || t === 'all tickets' || t === 'all listings') {
+        b.click();
+        return `clicked all: "${(b.innerText||'').trim()}"`;
+      }
+    }
+    return null;
+  });
+
+  if (clicked) {
+    console.log(`  ${clicked}`);
+    await page.waitForTimeout(800);
+  } else {
+    console.log('  No filter button matched — check === ALL PAGE BUTTONS === above');
+  }
 }
 
 async function waitForCategoryButtons(page, timeout = 8000) {
@@ -294,7 +319,6 @@ await Actor.init();
 
 const input = await Actor.getInput() || {};
 
-// Accept single eventId, comma-separated eventIds, or array of eventIds
 const rawIds = input.eventIds || input.eventId || null;
 const manualIds = rawIds
   ? (Array.isArray(rawIds) ? rawIds : String(rawIds).split(',').map(s => s.trim()).filter(Boolean))
@@ -307,7 +331,6 @@ if (manualIds && manualIds.length > 0) {
     .select('id,name,date,venue,platform,is_major,stubhub_url')
     .in('id', manualIds);
   const found = data || [];
-  // For any IDs not in DB, create placeholder entries
   events = manualIds.map(id => {
     return found.find(e => e.id === id) || {
       id, name: 'Manual FIFA Event', date: null,
@@ -405,7 +428,7 @@ const crawler = new PlaywrightCrawler({
 
     await page.waitForTimeout(1200);
     await dismissModals(page);
-    await dismissRecommended(page);          // ← switch to all tickets
+    await dismissRecommended(page);
     await waitForCategoryButtons(page, 8000);
 
     const html = await page.content();
@@ -472,7 +495,7 @@ const crawler = new PlaywrightCrawler({
             await page.goto(categoryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
             await page.waitForTimeout(1500);
             await dismissModals(page);
-            await dismissRecommended(page);  // ← kill recommended on category page too
+            await dismissRecommended(page);
             await page.waitForTimeout(600);
             const catPrices = await extractPricesFromPage(page);
             const catListings = await getListingCount(page);
@@ -484,7 +507,7 @@ const crawler = new PlaywrightCrawler({
             await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
             await page.waitForTimeout(1200);
             await dismissModals(page);
-            await dismissRecommended(page);  // ← keep all-tickets on return nav
+            await dismissRecommended(page);
             await waitForCategoryButtons(page, 5000);
           } else {
             console.log(`  ${cat.label}: no URL captured, floor only`);
@@ -497,7 +520,7 @@ const crawler = new PlaywrightCrawler({
             await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
             await page.waitForTimeout(1000);
             await dismissModals(page);
-            await dismissRecommended(page);  // ← and on error recovery
+            await dismissRecommended(page);
             await waitForCategoryButtons(page, 5000);
           } catch (_) {}
         }
