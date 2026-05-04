@@ -131,42 +131,42 @@ async function dismissRecommended(page) {
     const filtersBtn = page.locator('button:has-text("Filters"), [aria-label="Filters"], button:has-text("Filter")').first();
     if (await filtersBtn.isVisible({ timeout: 2000 })) {
       await filtersBtn.click({ timeout: 2000 });
-      await page.waitForTimeout(800);
+      await page.waitForTimeout(1000);
       console.log('  Opened Filters panel');
+    } else {
+      console.log('  Filters button not found');
+      return;
     }
 
-    // Step 2: Turn off "Recommended tickets" toggle inside the panel
+    // Step 2: Find the Recommended tickets toggle by aria-checked and click it off
     const toggled = await page.evaluate(() => {
-      // Find the toggle/checkbox near "Recommended tickets" text
-      const labels = Array.from(document.querySelectorAll('label, div, span, button'));
-      for (const el of labels) {
-        const t = (el.innerText || el.textContent || '').trim();
-        if (t.toLowerCase().includes('recommended tickets') || t.toLowerCase() === 'recommended') {
-          // Look for a toggle/checkbox nearby
-          const parent = el.closest('[class*="filter"], [class*="Filter"], section, div') || el.parentElement;
-          if (parent) {
-            // Find toggle button or checkbox within parent
-            const toggle = parent.querySelector('[role="switch"], input[type="checkbox"], button[aria-checked]');
-            if (toggle) {
-              const isOn = toggle.getAttribute('aria-checked') === 'true' ||
-                           toggle.checked === true ||
-                           toggle.getAttribute('data-state') === 'checked';
-              if (isOn) {
-                toggle.click();
-                return `turned off toggle near "${t}"`;
-              }
-            }
-            // If the element itself is clickable
-            if (el.tagName === 'BUTTON' || el.role === 'switch') {
-              el.click();
-              return `clicked element: "${t}"`;
-            }
-          }
-          // Try clicking the label itself
+      // Look for any element with role="switch" or aria-checked that is on
+      const switches = Array.from(document.querySelectorAll('[role="switch"], [aria-checked]'));
+      for (const el of switches) {
+        const checked = el.getAttribute('aria-checked');
+        const label = el.getAttribute('aria-label') || '';
+        const nearText = (el.closest('label, div, li')?.innerText || '').toLowerCase();
+        if (checked === 'true' && (label.toLowerCase().includes('recommend') || nearText.includes('recommend'))) {
           el.click();
-          return `clicked label: "${t}"`;
+          return `turned off switch: aria-checked=true label="${label}"`;
+        }
+        // Also check unchecked switches near "recommended" text — in case it needs to be clicked to toggle
+        if (nearText.includes('recommend')) {
+          el.click();
+          return `clicked switch near recommended: aria-checked="${checked}"`;
         }
       }
+
+      // Fallback: find any input[type=checkbox] near "recommended" text
+      const inputs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+      for (const inp of inputs) {
+        const nearText = (inp.closest('label, div, li')?.innerText || '').toLowerCase();
+        if (nearText.includes('recommend') && inp.checked) {
+          inp.click();
+          return `unchecked checkbox near recommended`;
+        }
+      }
+
       return null;
     });
 
@@ -174,16 +174,18 @@ async function dismissRecommended(page) {
       console.log(`  ${toggled}`);
       await page.waitForTimeout(800);
     } else {
-      console.log('  Recommended toggle not found in filters panel');
+      console.log('  Recommended toggle not found by aria — check filter panel HTML');
     }
 
-    // Step 3: Click "View X Listings" to apply and close the panel
+    // Step 3: Click "View X Listings" to apply and close
     try {
-      const viewBtn = page.locator('button:has-text("View"), button:has-text("Show")').first();
-      if (await viewBtn.isVisible({ timeout: 1500 })) {
+      await page.waitForTimeout(400);
+      const viewBtn = page.locator('button:has-text("View")').first();
+      if (await viewBtn.isVisible({ timeout: 2000 })) {
+        const btnText = await viewBtn.innerText();
         await viewBtn.click({ timeout: 2000 });
-        await page.waitForTimeout(800);
-        console.log('  Applied filters');
+        await page.waitForTimeout(1000);
+        console.log(`  Applied: ${btnText.trim()}`);
       }
     } catch (_) {}
 
@@ -277,7 +279,7 @@ async function interceptNextCategoryUrl(page) {
         !url.includes('google') && !url.includes('doubleclick') && !url.includes('viagogo')
       ) {
         window.__capturedCategoryUrl = url.startsWith('http') ? url : 'https://www.stubhub.com' + url;
-        console.log('[VKT intercept fetch]', window.__capturedCategoryUrl.slice(0,120));
+        console.log('[VKT] fetch captured:', window.__capturedCategoryUrl.slice(0,120));
       }
       return window.__origFetch.apply(this, args);
     };
@@ -294,7 +296,7 @@ async function interceptNextCategoryUrl(page) {
           !url.includes('google') && !url.includes('doubleclick')
         ) {
           window.__capturedCategoryUrl = url.startsWith('http') ? url : 'https://www.stubhub.com' + url;
-          console.log('[VKT intercept xhr]', window.__capturedCategoryUrl.slice(0,120));
+          console.log('[VKT] xhr captured:', window.__capturedCategoryUrl.slice(0,120));
         }
         return origOpen(method, url, ...rest);
       };
@@ -478,36 +480,33 @@ const crawler = new PlaywrightCrawler({
     if (categoryButtons.length > 0) {
       for (const cat of categoryButtons) {
         try {
+          // Reset capture
           await interceptNextCategoryUrl(page);
 
-          // Also capture via Playwright network interception
-          let playwrightCapturedUrl = null;
-          const urlHandler = (route) => {
-            const url = route.request().url();
-            if (
-              (url.includes('ticketClasses=') || url.includes('listings')) &&
-              url.includes('stubhub') &&
-              !url.includes('google')
-            ) {
-              playwrightCapturedUrl = url;
+          // Try Playwright native click first (triggers real browser events + fetch)
+          let clicked = false;
+          try {
+            const chip = page.locator(`[data-testid="event-detail-zone-chip"]`).nth(cat.index);
+            if (await chip.isVisible({ timeout: 1000 })) {
+              await chip.click({ timeout: 2000 });
+              clicked = true;
             }
-            route.continue().catch(() => {});
-          };
-          await page.route('**/*', urlHandler);
+          } catch (_) {}
 
-          await page.evaluate((idx) => {
-            const chips = document.querySelectorAll('[data-testid="event-detail-zone-chip"]');
-            if (chips[idx]) {
-              chips[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return;
-            }
-            const btns = Array.from(document.querySelectorAll('button'))
-              .filter(b => /^Category\s+\d/i.test((b.innerText||'').trim()));
-            if (btns[idx]) btns[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-          }, cat.index);
+          // Fallback to evaluate click
+          if (!clicked) {
+            await page.evaluate((idx) => {
+              const chips = document.querySelectorAll('[data-testid="event-detail-zone-chip"]');
+              if (chips[idx]) { chips[idx].click(); return; }
+              const btns = Array.from(document.querySelectorAll('button'))
+                .filter(b => /^Category\s+\d/i.test((b.innerText||'').trim()));
+              if (btns[idx]) btns[idx].click();
+            }, cat.index);
+          }
 
-          await page.waitForTimeout(1500);
-          await page.unroute('**/*', urlHandler);
-          const categoryUrl = (await getCapturedUrl(page)) || playwrightCapturedUrl;
+          // Wait longer for fetch to fire
+          await page.waitForTimeout(2000);
+          const categoryUrl = await getCapturedUrl(page);
           if (categoryUrl) console.log(`  ${cat.label}: captured URL = ${categoryUrl.slice(0,80)}`);
 
           if (categoryUrl) {
