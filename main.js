@@ -1,6 +1,7 @@
 import { Actor } from 'apify';
 import { PlaywrightCrawler } from 'crawlee';
 import { createClient } from '@supabase/supabase-js';
+import ws from 'ws';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVueXBhc2l0Ynp1bGFmZWhicXRqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMTE2MjAsImV4cCI6MjA5MDU4NzYyMH0.ywGB7ZccbVxcgZDXMOQB9Ui8R-SF4xF0SKkWavDbRGI';
@@ -11,7 +12,7 @@ const FIFA_EVENT_LIMIT = parseInt(process.env.FIFA_EVENT_LIMIT || '104', 10);
 const MIN_PRICE = 10;
 const MAX_PRICE = 25000;
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { realtime: { transport: ws } });
 
 function safeNum(v) {
   const n = Number(v);
