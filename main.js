@@ -191,19 +191,20 @@ async function dismissRecommended(page) {
     } catch (_) {}
   }
 
-  // Strategy 2: find and deselect active Recommended, or click any All button
+  // Strategy 2: click Recommended button by class or text — no aria attributes needed
   const clicked = await page.evaluate(() => {
-    const btns = Array.from(document.querySelectorAll('button, [role="tab"], [role="option"], [role="radio"]'));
+    const btns = Array.from(document.querySelectorAll('button'));
+
+    // Primary: find any button with text "Recommended" and click it to deselect
     for (const b of btns) {
-      const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-      const pressed = b.getAttribute('aria-pressed');
-      const selected = b.getAttribute('aria-selected');
-      const current = b.getAttribute('aria-current');
-      if (t.includes('recommend') && (pressed === 'true' || selected === 'true' || current === 'true')) {
+      const t = (b.innerText || b.textContent || '').trim();
+      if (t === 'Recommended') {
         b.click();
-        return `deselected recommended: "${(b.innerText||'').trim()}"`;
+        return `clicked Recommended button (class: ${b.className.slice(0,60)})`;
       }
     }
+
+    // Fallback: any "All" button
     for (const b of btns) {
       const t = (b.innerText || b.textContent || '').trim().toLowerCase();
       if (t === 'all' || t === 'all tickets' || t === 'all listings') {
@@ -211,6 +212,20 @@ async function dismissRecommended(page) {
         return `clicked all: "${(b.innerText||'').trim()}"`;
       }
     }
+
+    // Fallback: aria-pressed/selected/current checks
+    const all = Array.from(document.querySelectorAll('button, [role="tab"], [role="option"], [role="radio"]'));
+    for (const b of all) {
+      const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+      const pressed = b.getAttribute('aria-pressed');
+      const selected = b.getAttribute('aria-selected');
+      const current = b.getAttribute('aria-current');
+      if (t.includes('recommend') && (pressed === 'true' || selected === 'true' || current === 'true')) {
+        b.click();
+        return `deselected aria recommended: "${(b.innerText||'').trim()}"`;
+      }
+    }
+
     return null;
   });
 
