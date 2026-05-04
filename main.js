@@ -125,52 +125,6 @@ async function dismissModals(page) {
   }
 }
 
-async function quickDismissRecommended(page) {
-  // Lightweight version for category pages - single fast attempt, no retries
-  try {
-    const clicked = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
-      for (const b of buttons) {
-        const testid = (b.getAttribute('data-testid') || '').toLowerCase();
-        const text = (b.innerText || b.textContent || '').trim().toLowerCase();
-        if (testid === 'event-detail-filters-button' || text === 'filters' || text === 'filter') {
-          b.click();
-          return true;
-        }
-      }
-      return false;
-    });
-    if (!clicked) return;
-    await page.waitForTimeout(1000);
-
-    const toggled = await page.evaluate(() => {
-      const candidates = Array.from(document.querySelectorAll('[role="switch"], [aria-checked], input[type="checkbox"]'));
-      for (const el of candidates) {
-        const text = [
-          el.getAttribute('aria-label') || '',
-          el.closest('label, div, li, section')?.innerText || '',
-          el.parentElement?.innerText || ''
-        ].join(' ').toLowerCase();
-        if (!text.includes('recommend')) continue;
-        const isInput = el.tagName.toLowerCase() === 'input';
-        const isOn = isInput ? el.checked : el.getAttribute('aria-checked') === 'true';
-        if (isOn) { el.click(); return true; }
-        return false;
-      }
-      return false;
-    });
-
-    if (toggled) {
-      await page.waitForTimeout(500);
-      const viewBtn = page.locator('button:has-text("View")').first();
-      if (await viewBtn.isVisible({ timeout: 1500 })) {
-        await viewBtn.click({ timeout: 1500 });
-        await page.waitForTimeout(2000);
-      }
-    }
-  } catch (_) {}
-}
-
 async function dismissRecommended(page) {
   try {
     let filtersOpened = false;
@@ -215,15 +169,6 @@ async function dismissRecommended(page) {
           if (isRealFiltersButton) {
             b.click();
             return { text, aria, testid, mode: 'real filters' };
-          }
-        }
-
-        // 2. Fallback: click Popular filters if real Filters button not found
-        for (const b of buttons) {
-          const text = (b.innerText || b.textContent || '').trim().toLowerCase();
-          if (text === 'popular filters' || text.includes('popular filters')) {
-            b.click();
-            return { text, aria: '', testid: '', mode: 'popular filters fallback' };
           }
         }
 
@@ -574,15 +519,11 @@ const crawler = new PlaywrightCrawler({
     }
 
     const categoryData = [];
-    const baseUrl = request.url.split('?')[0];
 
     if (categoryButtons.length > 0) {
       for (const cat of categoryButtons) {
         try {
-          // Reset capture
-          await interceptNextCategoryUrl(page);
-
-          // Try Playwright native click first (triggers real browser events + fetch)
+          // Click category chip on main page (Recommended already off, so all listings visible)
           let clicked = false;
           try {
             const chip = page.locator(`[data-testid="event-detail-zone-chip"]`).nth(cat.index);
@@ -592,7 +533,6 @@ const crawler = new PlaywrightCrawler({
             }
           } catch (_) {}
 
-          // Fallback to evaluate click
           if (!clicked) {
             await page.evaluate((idx) => {
               const chips = document.querySelectorAll('[data-testid="event-detail-zone-chip"]');
@@ -603,41 +543,21 @@ const crawler = new PlaywrightCrawler({
             }, cat.index);
           }
 
-          // Wait longer for fetch to fire
+          // Wait for page to update with category-filtered listings
           await page.waitForTimeout(2000);
-          const categoryUrl = await getCapturedUrl(page);
-          if (categoryUrl) console.log(`  ${cat.label}: captured URL = ${categoryUrl.slice(0,80)}`);
 
-          if (categoryUrl) {
-            console.log(`  ${cat.label}: loading category URL`);
-            await page.goto(categoryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForTimeout(1500);
-            await dismissModals(page);
-            await quickDismissRecommended(page);
-            const catPrices = await extractPricesFromPage(page);
-            const catListings = await getListingCount(page);
-            const floor = cat.floor;
-            const { avg, ceiling } = summarizeForAtpCeiling(catPrices, floor);
-            console.log(`  ${cat.label}: listings=${catListings}, floor=$${floor}, atp=$${avg}, ceiling=$${ceiling}`);
-            categoryData.push({ label: cat.label, listings: catListings, floor, avg, ceiling });
+          // Read everything from main page — filter is already off
+          const catListings = await getListingCount(page);
+          const catPrices = await extractPricesFromPage(page);
+          const floor = cat.floor;
+          const { avg, ceiling } = summarizeForAtpCeiling(catPrices, floor);
 
-            await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForTimeout(1500);
-            await dismissModals(page);
-            await waitForCategoryButtons(page, 5000);
-          } else {
-            console.log(`  ${cat.label}: no URL captured, floor only`);
-            categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
-          }
+          console.log(`  ${cat.label}: listings=${catListings}, floor=$${floor}, atp=$${avg}, ceiling=$${ceiling}`);
+          categoryData.push({ label: cat.label, listings: catListings, floor, avg, ceiling });
+
         } catch (e) {
           console.log(`  ${cat.label} error: ${e.message.slice(0,80)}`);
           categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
-          try {
-            await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForTimeout(1500);
-            await dismissModals(page);
-            await waitForCategoryButtons(page, 5000);
-          } catch (_) {}
         }
       }
     }
