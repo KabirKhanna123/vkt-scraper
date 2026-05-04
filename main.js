@@ -132,6 +132,22 @@ async function dismissRecommended(page) {
     console.log('  Looking for Filters button...');
     await page.waitForTimeout(3000);
 
+    // Debug: log all filter-related buttons
+    const filterBtns = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('button, [role="button"]'))
+        .map(b => ({
+          text: (b.innerText || '').trim(),
+          aria: b.getAttribute('aria-label') || '',
+          testid: b.getAttribute('data-testid') || ''
+        }))
+        .filter(x =>
+          x.text.toLowerCase().includes('filter') ||
+          x.aria.toLowerCase().includes('filter') ||
+          x.testid.toLowerCase().includes('filter')
+        )
+    );
+    console.log('  Filter-related buttons:', JSON.stringify(filterBtns));
+
     for (let attempt = 1; attempt <= 6; attempt++) {
       const clicked = await page.evaluate(() => {
         const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
@@ -139,7 +155,17 @@ async function dismissRecommended(page) {
           const text = (b.innerText || b.textContent || '').trim().toLowerCase();
           const aria = (b.getAttribute('aria-label') || '').toLowerCase();
           const testid = (b.getAttribute('data-testid') || '').toLowerCase();
-          if (text.includes('filter') || aria.includes('filter') || testid.includes('filter')) {
+          const isRealFiltersButton =
+            text === 'filters' ||
+            text === 'filter' ||
+            aria === 'filters' ||
+            aria === 'filter' ||
+            testid === 'filter-button' ||
+            testid === 'filters-button' ||
+            testid.includes('filter-button') ||
+            testid.includes('filters-button');
+
+          if (isRealFiltersButton) {
             b.click();
             return { text, aria, testid };
           }
