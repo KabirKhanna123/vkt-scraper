@@ -151,6 +151,8 @@ async function dismissRecommended(page) {
     for (let attempt = 1; attempt <= 6; attempt++) {
       const clicked = await page.evaluate(() => {
         const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+
+        // 1. Prefer real Filters button
         for (const b of buttons) {
           const text = (b.innerText || b.textContent || '').trim().toLowerCase();
           const aria = (b.getAttribute('aria-label') || '').toLowerCase();
@@ -166,9 +168,19 @@ async function dismissRecommended(page) {
 
           if (isRealFiltersButton) {
             b.click();
-            return { text, aria, testid };
+            return { text, aria, testid, mode: 'real filters' };
           }
         }
+
+        // 2. Fallback: click Popular filters if real Filters button not found
+        for (const b of buttons) {
+          const text = (b.innerText || b.textContent || '').trim().toLowerCase();
+          if (text === 'popular filters' || text.includes('popular filters')) {
+            b.click();
+            return { text, aria: '', testid: '', mode: 'popular filters fallback' };
+          }
+        }
+
         return null;
       });
 
