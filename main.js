@@ -127,114 +127,68 @@ async function dismissModals(page) {
 
 async function dismissRecommended(page) {
   try {
-    // Dump ALL buttons and interactive elements for debugging
-    const allButtons = await page.evaluate(() => {
-      const results = [];
-      document.querySelectorAll('button').forEach(b => {
-        const text = (b.innerText || b.textContent || '').trim().slice(0, 80);
-        if (!text) return;
-        results.push({
-          type: 'button',
-          text,
-          testid: b.getAttribute('data-testid') || '',
-          ariaPressed: b.getAttribute('aria-pressed') || '',
-          ariaSelected: b.getAttribute('aria-selected') || '',
-          ariaCurrent: b.getAttribute('aria-current') || '',
-          ariaLabel: b.getAttribute('aria-label') || '',
-          className: b.className.slice(0, 100),
-        });
-      });
-      document.querySelectorAll('[role="tab"], [role="option"], [role="radio"]').forEach(el => {
-        const text = (el.innerText || el.textContent || '').trim().slice(0, 80);
-        if (!text) return;
-        results.push({
-          type: el.getAttribute('role'),
-          text,
-          testid: el.getAttribute('data-testid') || '',
-          ariaPressed: el.getAttribute('aria-pressed') || '',
-          ariaSelected: el.getAttribute('aria-selected') || '',
-          ariaCurrent: el.getAttribute('aria-current') || '',
-          ariaLabel: el.getAttribute('aria-label') || '',
-          className: el.className.slice(0, 100),
-        });
-      });
-      return results;
+    // Step 1: Open the Filters panel
+    const filtersBtn = page.locator('button:has-text("Filters"), [aria-label="Filters"], button:has-text("Filter")').first();
+    if (await filtersBtn.isVisible({ timeout: 2000 })) {
+      await filtersBtn.click({ timeout: 2000 });
+      await page.waitForTimeout(800);
+      console.log('  Opened Filters panel');
+    }
+
+    // Step 2: Turn off "Recommended tickets" toggle inside the panel
+    const toggled = await page.evaluate(() => {
+      // Find the toggle/checkbox near "Recommended tickets" text
+      const labels = Array.from(document.querySelectorAll('label, div, span, button'));
+      for (const el of labels) {
+        const t = (el.innerText || el.textContent || '').trim();
+        if (t.toLowerCase().includes('recommended tickets') || t.toLowerCase() === 'recommended') {
+          // Look for a toggle/checkbox nearby
+          const parent = el.closest('[class*="filter"], [class*="Filter"], section, div') || el.parentElement;
+          if (parent) {
+            // Find toggle button or checkbox within parent
+            const toggle = parent.querySelector('[role="switch"], input[type="checkbox"], button[aria-checked]');
+            if (toggle) {
+              const isOn = toggle.getAttribute('aria-checked') === 'true' ||
+                           toggle.checked === true ||
+                           toggle.getAttribute('data-state') === 'checked';
+              if (isOn) {
+                toggle.click();
+                return `turned off toggle near "${t}"`;
+              }
+            }
+            // If the element itself is clickable
+            if (el.tagName === 'BUTTON' || el.role === 'switch') {
+              el.click();
+              return `clicked element: "${t}"`;
+            }
+          }
+          // Try clicking the label itself
+          el.click();
+          return `clicked label: "${t}"`;
+        }
+      }
+      return null;
     });
 
-    console.log('\n  === ALL PAGE BUTTONS ===');
-    allButtons.forEach(b => {
-      console.log(`  [${b.type}] "${b.text}" | testid="${b.testid}" | pressed="${b.ariaPressed}" | selected="${b.ariaSelected}" | current="${b.ariaCurrent}" | label="${b.ariaLabel}"`);
-    });
-    console.log('  === END BUTTONS ===\n');
-  } catch (e) {
-    console.log('  Debug error:', e.message);
-  }
+    if (toggled) {
+      console.log(`  ${toggled}`);
+      await page.waitForTimeout(800);
+    } else {
+      console.log('  Recommended toggle not found in filters panel');
+    }
 
-  // Strategy 1: playwright locators for All Tickets variants
-  const allSelectors = [
-    'button:has-text("All Tickets")',
-    'button:has-text("All listings")',
-    '[data-testid="all-listings-tab"]',
-    '[data-testid="listings-tab-all"]',
-    '[data-testid="sort-filter-all"]',
-    '[aria-label="All Tickets"]',
-    '[aria-label="All listings"]',
-  ];
-  for (const sel of allSelectors) {
+    // Step 3: Click "View X Listings" to apply and close the panel
     try {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 400 })) {
-        await el.click({ timeout: 600 });
+      const viewBtn = page.locator('button:has-text("View"), button:has-text("Show")').first();
+      if (await viewBtn.isVisible({ timeout: 1500 })) {
+        await viewBtn.click({ timeout: 2000 });
         await page.waitForTimeout(800);
-        console.log(`  Clicked: ${sel}`);
-        return;
+        console.log('  Applied filters');
       }
     } catch (_) {}
-  }
 
-  // Strategy 2: click Recommended button by class or text — no aria attributes needed
-  const clicked = await page.evaluate(() => {
-    const btns = Array.from(document.querySelectorAll('button'));
-
-    // Primary: find any button with text "Recommended" and click it to deselect
-    for (const b of btns) {
-      const t = (b.innerText || b.textContent || '').trim();
-      if (t === 'Recommended') {
-        b.click();
-        return `clicked Recommended button (class: ${b.className.slice(0,60)})`;
-      }
-    }
-
-    // Fallback: any "All" button
-    for (const b of btns) {
-      const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-      if (t === 'all' || t === 'all tickets' || t === 'all listings') {
-        b.click();
-        return `clicked all: "${(b.innerText||'').trim()}"`;
-      }
-    }
-
-    // Fallback: aria-pressed/selected/current checks
-    const all = Array.from(document.querySelectorAll('button, [role="tab"], [role="option"], [role="radio"]'));
-    for (const b of all) {
-      const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-      const pressed = b.getAttribute('aria-pressed');
-      const selected = b.getAttribute('aria-selected');
-      const current = b.getAttribute('aria-current');
-      if (t.includes('recommend') && (pressed === 'true' || selected === 'true' || current === 'true')) {
-        b.click();
-        return `deselected aria recommended: "${(b.innerText||'').trim()}"`;
-      }
-    }
-
-    return null;
-  });
-
-  if (clicked) {
-    console.log(`  ${clicked}`);
-    await page.waitForTimeout(800);
-  } else {
-    console.log('  No filter button matched — check === ALL PAGE BUTTONS === above');
+  } catch (e) {
+    console.log('  dismissRecommended error:', e.message.slice(0, 80));
   }
 }
 
@@ -312,17 +266,39 @@ async function getCategoryButtons(page) {
 async function interceptNextCategoryUrl(page) {
   await page.evaluate(() => {
     window.__capturedCategoryUrl = null;
+
+    // Intercept fetch
     if (!window.__origFetch) window.__origFetch = window.fetch;
     window.fetch = function (...args) {
       const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
       if (
-        url.includes('ticketClasses=') &&
+        (url.includes('ticketClasses=') || url.includes('zoneMapping') || url.includes('listings')) &&
         (url.includes('/event/') || url.includes('stubhub')) &&
         !url.includes('google') && !url.includes('doubleclick') && !url.includes('viagogo')
       ) {
         window.__capturedCategoryUrl = url.startsWith('http') ? url : 'https://www.stubhub.com' + url;
+        console.log('[VKT intercept fetch]', window.__capturedCategoryUrl.slice(0,120));
       }
       return window.__origFetch.apply(this, args);
+    };
+
+    // Intercept XHR too
+    const OrigXHR = window.XMLHttpRequest;
+    window.XMLHttpRequest = function() {
+      const xhr = new OrigXHR();
+      const origOpen = xhr.open.bind(xhr);
+      xhr.open = function(method, url, ...rest) {
+        if (
+          (url.includes('ticketClasses=') || url.includes('zoneMapping') || url.includes('listings')) &&
+          (url.includes('/event/') || url.includes('stubhub')) &&
+          !url.includes('google') && !url.includes('doubleclick')
+        ) {
+          window.__capturedCategoryUrl = url.startsWith('http') ? url : 'https://www.stubhub.com' + url;
+          console.log('[VKT intercept xhr]', window.__capturedCategoryUrl.slice(0,120));
+        }
+        return origOpen(method, url, ...rest);
+      };
+      return xhr;
     };
   });
 }
@@ -444,6 +420,17 @@ const crawler = new PlaywrightCrawler({
 
     await page.waitForTimeout(1200);
     await dismissModals(page);
+
+    // Click "Show more" and "View N Listings" to expand all listings
+    try {
+      const viewAll = page.locator('button:has-text("View"), button:has-text("Show more")').first();
+      if (await viewAll.isVisible({ timeout: 1000 })) {
+        await viewAll.click({ timeout: 1500 });
+        await page.waitForTimeout(800);
+        console.log('  Clicked view/show more button');
+      }
+    } catch (_) {}
+
     await dismissRecommended(page);
     await waitForCategoryButtons(page, 8000);
 
@@ -493,6 +480,21 @@ const crawler = new PlaywrightCrawler({
         try {
           await interceptNextCategoryUrl(page);
 
+          // Also capture via Playwright network interception
+          let playwrightCapturedUrl = null;
+          const urlHandler = (route) => {
+            const url = route.request().url();
+            if (
+              (url.includes('ticketClasses=') || url.includes('listings')) &&
+              url.includes('stubhub') &&
+              !url.includes('google')
+            ) {
+              playwrightCapturedUrl = url;
+            }
+            route.continue().catch(() => {});
+          };
+          await page.route('**/*', urlHandler);
+
           await page.evaluate((idx) => {
             const chips = document.querySelectorAll('[data-testid="event-detail-zone-chip"]');
             if (chips[idx]) {
@@ -503,8 +505,10 @@ const crawler = new PlaywrightCrawler({
             if (btns[idx]) btns[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
           }, cat.index);
 
-          await page.waitForTimeout(1200);
-          const categoryUrl = await getCapturedUrl(page);
+          await page.waitForTimeout(1500);
+          await page.unroute('**/*', urlHandler);
+          const categoryUrl = (await getCapturedUrl(page)) || playwrightCapturedUrl;
+          if (categoryUrl) console.log(`  ${cat.label}: captured URL = ${categoryUrl.slice(0,80)}`);
 
           if (categoryUrl) {
             console.log(`  ${cat.label}: loading category URL`);
