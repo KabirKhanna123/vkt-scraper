@@ -127,51 +127,46 @@ async function dismissModals(page) {
 
 async function dismissRecommended(page) {
   try {
-    // Step 1: Open the Filters panel
     let filtersOpened = false;
-    const filterSelectors = [
-      'button:has-text("Filters")',
-      'button:has-text("Filter")',
-      '[aria-label="Filters"]',
-      '[aria-label="Filter"]',
-      '[data-testid="filter-button"]',
-      '[data-testid="filters-button"]',
-    ];
-    for (const sel of filterSelectors) {
-      try {
-        const btn = page.locator(sel).first();
-        if (await btn.isVisible({ timeout: 2000 })) {
-          await btn.click({ timeout: 2000 });
-          await page.waitForTimeout(1200);
-          console.log(`  Opened Filters panel via: ${sel}`);
-          filtersOpened = true;
-          break;
-        }
-      } catch (_) {}
-    }
-    if (!filtersOpened) {
+
+    console.log('  Looking for Filters button...');
+    await page.waitForTimeout(3000);
+
+    for (let attempt = 1; attempt <= 6; attempt++) {
       const clicked = await page.evaluate(() => {
-        const btns = Array.from(document.querySelectorAll('button'));
-        for (const b of btns) {
-          const t = (b.innerText || '').trim().toLowerCase();
-          if (t === 'filters' || t === 'filter') { b.click(); return true; }
+        const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+        for (const b of buttons) {
+          const text = (b.innerText || b.textContent || '').trim().toLowerCase();
+          const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+          const testid = (b.getAttribute('data-testid') || '').toLowerCase();
+          if (text.includes('filter') || aria.includes('filter') || testid.includes('filter')) {
+            b.click();
+            return { text, aria, testid };
+          }
         }
-        return false;
+        return null;
       });
+
       if (clicked) {
-        await page.waitForTimeout(1200);
-        console.log('  Opened Filters panel via evaluate');
+        console.log(`  Opened Filters panel on attempt ${attempt}:`, JSON.stringify(clicked));
+        await page.waitForTimeout(1500);
         filtersOpened = true;
-      } else {
-        console.log('  Filters button not found — skipping');
-        return;
+        break;
       }
+
+      console.log(`  Filters not found attempt ${attempt}/6`);
+      await page.waitForTimeout(1500);
     }
 
-    // Step 2: Safely turn off Recommended tickets toggle — only if currently ON
-    const toggled = await page.evaluate(() => {
-      const candidates = Array.from(document.querySelectorAll('[role="switch"], [aria-checked], input[type="checkbox"]'));
+    if (!filtersOpened) {
+      console.log('  Filters button not found after retries — skipping');
+      return;
+    }
 
+    const toggled = await page.evaluate(() => {
+      const candidates = Array.from(
+        document.querySelectorAll('[role="switch"], [aria-checked], input[type="checkbox"]')
+      );
       for (const el of candidates) {
         const text = [
           el.getAttribute('aria-label') || '',
@@ -189,10 +184,8 @@ async function dismissRecommended(page) {
           el.click();
           return 'Recommended tickets turned OFF';
         }
-
         return 'Recommended tickets already OFF';
       }
-
       return null;
     });
 
@@ -200,23 +193,21 @@ async function dismissRecommended(page) {
       console.log(`  ${toggled}`);
       await page.waitForTimeout(800);
     } else {
-      console.log('  Recommended toggle not found in panel');
+      console.log('  Recommended toggle not found inside filters');
     }
 
-    // Step 3: Click "View X Listings" to apply and close
     try {
-      await page.waitForTimeout(400);
       const viewBtn = page.locator('button:has-text("View")').first();
-      if (await viewBtn.isVisible({ timeout: 2000 })) {
+      if (await viewBtn.isVisible({ timeout: 2500 })) {
         const btnText = await viewBtn.innerText();
-        await viewBtn.click({ timeout: 2000 });
-        await page.waitForTimeout(1000);
+        await viewBtn.click({ timeout: 2500 });
+        await page.waitForTimeout(1200);
         console.log(`  Applied: ${btnText.trim()}`);
       }
     } catch (_) {}
 
   } catch (e) {
-    console.log('  dismissRecommended error:', e.message.slice(0, 80));
+    console.log('  dismissRecommended error:', e.message.slice(0, 120));
   }
 }
 
@@ -437,10 +428,6 @@ const crawler = new PlaywrightCrawler({
     }
 
     await dismissModals(page);
-    await page.waitForTimeout(1000);
-
-    console.log('  Turning off recommended tickets...');
-    await dismissRecommended(page);
 
     console.log('  Waiting for listings/prices...');
     try {
@@ -450,8 +437,12 @@ const crawler = new PlaywrightCrawler({
       );
     } catch (_) { await page.waitForTimeout(1500); }
 
-    await page.waitForTimeout(1200);
-    await dismissModals(page);
+    await page.waitForTimeout(3000);
+
+    console.log('  Turning off recommended tickets...');
+    await dismissRecommended(page);
+
+    await page.waitForTimeout(1500);
     await waitForCategoryButtons(page, 8000);
 
     const html = await page.content();
