@@ -125,6 +125,52 @@ async function dismissModals(page) {
   }
 }
 
+async function quickDismissRecommended(page) {
+  // Lightweight version for category pages - single fast attempt, no retries
+  try {
+    const clicked = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+      for (const b of buttons) {
+        const testid = (b.getAttribute('data-testid') || '').toLowerCase();
+        const text = (b.innerText || b.textContent || '').trim().toLowerCase();
+        if (testid === 'event-detail-filters-button' || text === 'filters' || text === 'filter') {
+          b.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    if (!clicked) return;
+    await page.waitForTimeout(1000);
+
+    const toggled = await page.evaluate(() => {
+      const candidates = Array.from(document.querySelectorAll('[role="switch"], [aria-checked], input[type="checkbox"]'));
+      for (const el of candidates) {
+        const text = [
+          el.getAttribute('aria-label') || '',
+          el.closest('label, div, li, section')?.innerText || '',
+          el.parentElement?.innerText || ''
+        ].join(' ').toLowerCase();
+        if (!text.includes('recommend')) continue;
+        const isInput = el.tagName.toLowerCase() === 'input';
+        const isOn = isInput ? el.checked : el.getAttribute('aria-checked') === 'true';
+        if (isOn) { el.click(); return true; }
+        return false;
+      }
+      return false;
+    });
+
+    if (toggled) {
+      await page.waitForTimeout(500);
+      const viewBtn = page.locator('button:has-text("View")').first();
+      if (await viewBtn.isVisible({ timeout: 1500 })) {
+        await viewBtn.click({ timeout: 1500 });
+        await page.waitForTimeout(2000);
+      }
+    }
+  } catch (_) {}
+}
+
 async function dismissRecommended(page) {
   try {
     let filtersOpened = false;
@@ -567,6 +613,7 @@ const crawler = new PlaywrightCrawler({
             await page.goto(categoryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
             await page.waitForTimeout(1500);
             await dismissModals(page);
+            await quickDismissRecommended(page);
             const catPrices = await extractPricesFromPage(page);
             const catListings = await getListingCount(page);
             const floor = cat.floor;
