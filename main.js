@@ -127,15 +127,50 @@ async function dismissModals(page) {
 
 async function dismissRecommended(page) {
   try {
-    // Step 1: Open the Filters panel
-    const filtersBtn = page.locator('button:has-text("Filters"), [aria-label="Filters"], button:has-text("Filter")').first();
-    if (await filtersBtn.isVisible({ timeout: 2000 })) {
-      await filtersBtn.click({ timeout: 2000 });
-      await page.waitForTimeout(1000);
-      console.log('  Opened Filters panel');
-    } else {
-      console.log('  Filters button not found');
-      return;
+    // Step 1: Open the Filters panel — wait up to 6s for it to appear
+    let filtersOpened = false;
+    const filterSelectors = [
+      'button:has-text("Filters")',
+      'button:has-text("Filter")',
+      '[aria-label="Filters"]',
+      '[aria-label="Filter"]',
+      '[data-testid="filter-button"]',
+      '[data-testid="filters-button"]',
+    ];
+    for (const sel of filterSelectors) {
+      try {
+        const btn = page.locator(sel).first();
+        if (await btn.isVisible({ timeout: 3000 })) {
+          await btn.click({ timeout: 2000 });
+          await page.waitForTimeout(1200);
+          console.log(`  Opened Filters panel via: ${sel}`);
+          filtersOpened = true;
+          break;
+        }
+      } catch (_) {}
+    }
+
+    if (!filtersOpened) {
+      // Last resort: find by text in page evaluate
+      const clicked = await page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button'));
+        for (const b of btns) {
+          const t = (b.innerText || '').trim().toLowerCase();
+          if (t === 'filters' || t === 'filter') {
+            b.click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (clicked) {
+        await page.waitForTimeout(1200);
+        console.log('  Opened Filters panel via evaluate');
+        filtersOpened = true;
+      } else {
+        console.log('  Filters button not found — skipping filter dismiss');
+        return;
+      }
     }
 
     // Step 2: Find the Recommended tickets toggle by aria-checked and click it off
