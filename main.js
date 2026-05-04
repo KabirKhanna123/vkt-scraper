@@ -127,7 +127,7 @@ async function dismissModals(page) {
 
 async function dismissRecommended(page) {
   try {
-    // Step 1: Open the Filters panel — wait up to 6s for it to appear
+    // Step 1: Open the Filters panel
     let filtersOpened = false;
     const filterSelectors = [
       'button:has-text("Filters")',
@@ -140,7 +140,7 @@ async function dismissRecommended(page) {
     for (const sel of filterSelectors) {
       try {
         const btn = page.locator(sel).first();
-        if (await btn.isVisible({ timeout: 3000 })) {
+        if (await btn.isVisible({ timeout: 2000 })) {
           await btn.click({ timeout: 2000 });
           await page.waitForTimeout(1200);
           console.log(`  Opened Filters panel via: ${sel}`);
@@ -149,17 +149,12 @@ async function dismissRecommended(page) {
         }
       } catch (_) {}
     }
-
     if (!filtersOpened) {
-      // Last resort: find by text in page evaluate
       const clicked = await page.evaluate(() => {
         const btns = Array.from(document.querySelectorAll('button'));
         for (const b of btns) {
           const t = (b.innerText || '').trim().toLowerCase();
-          if (t === 'filters' || t === 'filter') {
-            b.click();
-            return true;
-          }
+          if (t === 'filters' || t === 'filter') { b.click(); return true; }
         }
         return false;
       });
@@ -168,38 +163,34 @@ async function dismissRecommended(page) {
         console.log('  Opened Filters panel via evaluate');
         filtersOpened = true;
       } else {
-        console.log('  Filters button not found — skipping filter dismiss');
+        console.log('  Filters button not found — skipping');
         return;
       }
     }
 
-    // Step 2: Find the Recommended tickets toggle by aria-checked and click it off
+    // Step 2: Safely turn off Recommended tickets toggle — only if currently ON
     const toggled = await page.evaluate(() => {
-      // Look for any element with role="switch" or aria-checked that is on
-      const switches = Array.from(document.querySelectorAll('[role="switch"], [aria-checked]'));
-      for (const el of switches) {
-        const checked = el.getAttribute('aria-checked');
-        const label = el.getAttribute('aria-label') || '';
-        const nearText = (el.closest('label, div, li')?.innerText || '').toLowerCase();
-        if (checked === 'true' && (label.toLowerCase().includes('recommend') || nearText.includes('recommend'))) {
-          el.click();
-          return `turned off switch: aria-checked=true label="${label}"`;
-        }
-        // Also check unchecked switches near "recommended" text — in case it needs to be clicked to toggle
-        if (nearText.includes('recommend')) {
-          el.click();
-          return `clicked switch near recommended: aria-checked="${checked}"`;
-        }
-      }
+      const candidates = Array.from(document.querySelectorAll('[role="switch"], [aria-checked], input[type="checkbox"]'));
 
-      // Fallback: find any input[type=checkbox] near "recommended" text
-      const inputs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
-      for (const inp of inputs) {
-        const nearText = (inp.closest('label, div, li')?.innerText || '').toLowerCase();
-        if (nearText.includes('recommend') && inp.checked) {
-          inp.click();
-          return `unchecked checkbox near recommended`;
+      for (const el of candidates) {
+        const text = [
+          el.getAttribute('aria-label') || '',
+          el.closest('label, div, li, section')?.innerText || '',
+          el.parentElement?.innerText || ''
+        ].join(' ').toLowerCase();
+
+        if (!text.includes('recommend')) continue;
+
+        const ariaChecked = el.getAttribute('aria-checked');
+        const isInput = el.tagName.toLowerCase() === 'input';
+        const isOn = isInput ? el.checked : ariaChecked === 'true';
+
+        if (isOn) {
+          el.click();
+          return 'Recommended tickets turned OFF';
         }
+
+        return 'Recommended tickets already OFF';
       }
 
       return null;
@@ -209,7 +200,7 @@ async function dismissRecommended(page) {
       console.log(`  ${toggled}`);
       await page.waitForTimeout(800);
     } else {
-      console.log('  Recommended toggle not found by aria — check filter panel HTML');
+      console.log('  Recommended toggle not found in panel');
     }
 
     // Step 3: Click "View X Listings" to apply and close
@@ -446,6 +437,10 @@ const crawler = new PlaywrightCrawler({
     }
 
     await dismissModals(page);
+    await page.waitForTimeout(1000);
+
+    console.log('  Turning off recommended tickets...');
+    await dismissRecommended(page);
 
     console.log('  Waiting for listings/prices...');
     try {
@@ -457,18 +452,6 @@ const crawler = new PlaywrightCrawler({
 
     await page.waitForTimeout(1200);
     await dismissModals(page);
-
-    // Click "Show more" and "View N Listings" to expand all listings
-    try {
-      const viewAll = page.locator('button:has-text("View"), button:has-text("Show more")').first();
-      if (await viewAll.isVisible({ timeout: 1000 })) {
-        await viewAll.click({ timeout: 1500 });
-        await page.waitForTimeout(800);
-        console.log('  Clicked view/show more button');
-      }
-    } catch (_) {}
-
-    await dismissRecommended(page);
     await waitForCategoryButtons(page, 8000);
 
     const html = await page.content();
@@ -559,8 +542,14 @@ const crawler = new PlaywrightCrawler({
             categoryData.push({ label: cat.label, listings: catListings, floor, avg, ceiling });
 
             await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForTimeout(1200);
+            await page.waitForTimeout(2000);
             await dismissModals(page);
+            try {
+              await page.waitForFunction(
+                () => Array.from(document.querySelectorAll('button')).some(b => (b.innerText||'').trim().toLowerCase() === 'filters'),
+                { timeout: 6000 }
+              );
+            } catch (_) {}
             await dismissRecommended(page);
             await waitForCategoryButtons(page, 5000);
           } else {
@@ -572,8 +561,14 @@ const crawler = new PlaywrightCrawler({
           categoryData.push({ label: cat.label, listings: 0, floor: cat.floor, avg: null, ceiling: null });
           try {
             await page.goto(baseUrl + '?quantity=0', { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForTimeout(1000);
+            await page.waitForTimeout(2000);
             await dismissModals(page);
+            try {
+              await page.waitForFunction(
+                () => Array.from(document.querySelectorAll('button')).some(b => (b.innerText||'').trim().toLowerCase() === 'filters'),
+                { timeout: 6000 }
+              );
+            } catch (_) {}
             await dismissRecommended(page);
             await waitForCategoryButtons(page, 5000);
           } catch (_) {}
