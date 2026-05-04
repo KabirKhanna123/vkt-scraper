@@ -130,7 +130,43 @@ async function dismissRecommended(page) {
     let filtersOpened = false;
 
     console.log('  Looking for Filters button...');
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(2000);
+
+    // First: check if Recommended toggle is already visible without opening any panel
+    const directToggle = await page.evaluate(() => {
+      const candidates = Array.from(document.querySelectorAll('[role="switch"], [aria-checked], input[type="checkbox"]'));
+      for (const el of candidates) {
+        const text = [
+          el.getAttribute('aria-label') || '',
+          el.closest('label, div, li, section')?.innerText || '',
+          el.parentElement?.innerText || ''
+        ].join(' ').toLowerCase();
+        if (!text.includes('recommend')) continue;
+        const isInput = el.tagName.toLowerCase() === 'input';
+        const isOn = isInput ? el.checked : el.getAttribute('aria-checked') === 'true';
+        if (isOn) { el.click(); return 'Recommended turned OFF directly'; }
+        return 'Recommended already OFF';
+      }
+      return null;
+    });
+    if (directToggle) {
+      console.log(`  ${directToggle}`);
+      if (directToggle.includes('turned OFF')) {
+        await page.waitForTimeout(1000);
+        try {
+          const viewBtn = page.locator('button:has-text("View")').first();
+          if (await viewBtn.isVisible({ timeout: 1500 })) {
+            const btnText = await viewBtn.innerText();
+            await viewBtn.click({ timeout: 1500 });
+            await page.waitForTimeout(3000);
+            console.log(`  Applied: ${btnText.trim()}`);
+          }
+        } catch (_) {}
+      }
+      return;
+    }
+
+    await page.waitForTimeout(1000);
 
     // Debug: log all filter-related buttons
     const filterBtns = await page.evaluate(() =>
@@ -152,23 +188,37 @@ async function dismissRecommended(page) {
       const clicked = await page.evaluate(() => {
         const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
 
-        // 1. Prefer real Filters button
+        // 1. Real filters button first
         for (const b of buttons) {
-          const text = (b.innerText || b.textContent || '').trim().toLowerCase();
+          const text = (b.innerText || '').trim().toLowerCase();
           const aria = (b.getAttribute('aria-label') || '').toLowerCase();
           const testid = (b.getAttribute('data-testid') || '').toLowerCase();
-          const isRealFiltersButton =
-            testid === 'event-detail-filters-button' ||
-            testid === 'filter-button' ||
-            testid === 'filters-button' ||
-            text === 'filters' ||
-            text === 'filter' ||
-            aria === 'filters' ||
-            aria === 'filter';
-
-          if (isRealFiltersButton) {
+          if (
+            testid.includes('filters') ||
+            testid.includes('filter-button') ||
+            aria.includes('filters') ||
+            text === 'filters'
+          ) {
             b.click();
-            return { text, aria, testid, mode: 'real filters' };
+            return { mode: 'real filters', text, testid };
+          }
+        }
+
+        // 2. Fallback: Popular filters
+        for (const b of buttons) {
+          const text = (b.innerText || '').trim().toLowerCase();
+          if (text.includes('popular filters')) {
+            b.click();
+            return { mode: 'popular filters fallback', text };
+          }
+        }
+
+        // 3. Last resort: any filter-related button
+        for (const b of buttons) {
+          const text = (b.innerText || '').trim().toLowerCase();
+          if (text.includes('filter')) {
+            b.click();
+            return { mode: 'last resort', text };
           }
         }
 
@@ -544,10 +594,11 @@ const crawler = new PlaywrightCrawler({
           }
 
           // Wait for page to update with category-filtered listings
-          await page.waitForTimeout(2000);
+          await page.waitForTimeout(2500);
 
           // Read everything from main page — filter is already off
           const catListings = await getListingCount(page);
+          console.log(`  ${cat.label}: raw listing count = ${catListings}`);
           const catPrices = await extractPricesFromPage(page);
           const floor = cat.floor;
           const { avg, ceiling } = summarizeForAtpCeiling(catPrices, floor);
